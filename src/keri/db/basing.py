@@ -783,10 +783,10 @@ class Baser(LMDBer):
             Multiple values per key stored as ordered set (duplicates ignored).
             Entries persist until removed by the KRAM pruner.
 
-        .kramTSGS is named subDB instance of CatCesrIoSetSuber for KRAM partially
+        .kramLSGS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key trans last sig group attachments. Each group is
             stored per-siger as a flat (Prefixer, Seqner, Saider, Siger) tuple.
-            subkey 'tsgs.'
+            subkey 'lsgs.'
             DB is keyed by (AID, MID): sender identifier prefix plus message SAID
             Value is (Prefixer, Number, Diger, Siger) tuple. Sourced from
             parser kwa key 'tsgs'.
@@ -868,6 +868,8 @@ class Baser(LMDBer):
         kevers (statedict): read through cache of kevers of states for KELs in db
 
     """
+
+    MaxNamedDBs = 102
 
     def __init__(self, headDirPath=None, reopen=False, **kwa):
         """
@@ -1288,8 +1290,8 @@ class Baser(LMDBer):
                                                   klas=(coring.Prefixer, coring.Number,
                                                         coring.Diger, indexing.Siger))
 
-        # tsgs: trans last sig groups (prefixer, number, diger, siger) — stored per-siger
-        self.kramTSGS = subing.CatCesrIoSetSuber(db=self, subkey='tsgs.',
+        # lsgs: trans last sig groups (prefixer, number, diger, siger) — stored per-siger
+        self.kramLSGS = subing.CatCesrIoSetSuber(db=self, subkey='lsgs.',
                                                   klas=(coring.Prefixer, coring.Number,
                                                         coring.Diger, indexing.Siger))
 

@@ -65,7 +65,7 @@ Fields:
         Kramer._scrubSameSenderPriorEventTsgs).
         Empty when no such tsgs verified historically.
         Non-auth DB storage skips sender-addressed tsgs when writing
-        kramTSGS (see :meth:`Kramer._storeNonAuthAttachments`).
+        kramLSGS (see :meth:`Kramer._storeNonAuthAttachments`).
 
 Key state ref and tholder are derivable from the sender's kever
 (current key state) and are not included here. Callers that need
@@ -760,7 +760,7 @@ class Kramer:
         from the sender cannot authenticate this message via that triple and
         are retained as ordinary attachments.
 
-        Sender-addressed tsgs quads are not written to kramTSGS (they are
+        Sender-addressed tsgs quads are not written to kramLSGS (they are
         authenticator material, not non-auth forwarding); other prefixers'
         tsgs are stored. The live kwa dict is not mutated by this method;
         signature scrubbing may already have run in _verifyAttachedSigs.
@@ -776,7 +776,7 @@ class Kramer:
             if prefixer.qb64 == senderId:
                 continue
             for siger in sigers:
-                self.db.kramTSGS.add(key, (prefixer, number, diger, siger))
+                self.db.kramLSGS.add(key, (prefixer, number, diger, siger))
         for prefixer, number, diger in kwa.get('ssts', []):
             if prefixer.qb64 != senderId:
                 self.db.kramSSTS.add(key, (prefixer, number, diger))
@@ -801,7 +801,7 @@ class Kramer:
             key (tuple): (AID, MID) partial db key
         """
         self.db.kramTRQS.rem(key)
-        self.db.kramTSGS.rem(key)
+        self.db.kramLSGS.rem(key)
         self.db.kramSSCS.rem(key)
         self.db.kramSSTS.rem(key)
         self.db.kramFRCS.rem(key)
@@ -857,7 +857,7 @@ class Kramer:
         kwa['trqs'] = self._dedupeAttachmentItems(
             trqsEsc + kwa.get('trqs', []))
 
-        flatTsgs = list(self.db.kramTSGS.get(partialKey) or [])
+        flatTsgs = list(self.db.kramLSGS.get(partialKey) or [])
         groups = {}
         for prefixer, number, diger, siger in flatTsgs:
             gk = (prefixer.qb64, number.sn, diger.qb64)

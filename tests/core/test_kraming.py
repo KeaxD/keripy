@@ -1818,7 +1818,7 @@ def test_non_auth_attachments_stored(mockHelpingNowUTC):
             trqs = [(prefixer, seqner, saider, allSigers[0])]
 
             # tsgs: foreign prefix only (sender current tsgs are folded into sigers
-            # and not stored as non-auth in kramTSGS)
+            # and not stored as non-auth in kramLSGS)
             tsgs = [(otherPrefixer, seqner, saider, [allSigers[0]])]
 
             # sscs: first seen seal couple (seqner, saider) — not copied to partial DBs
@@ -1871,7 +1871,7 @@ def test_non_auth_attachments_stored(mockHelpingNowUTC):
             # Non-auth attachment dbs populated (not sscs)
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) == 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) == 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) == 1
@@ -1889,7 +1889,7 @@ def test_non_auth_attachments_stored(mockHelpingNowUTC):
 
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) == 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) == 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) == 1
@@ -1916,7 +1916,7 @@ def test_non_auth_attachments_stored(mockHelpingNowUTC):
             # Non-auth attachments persist (pruner cleans up, not kramit)
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) >= 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) >= 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) >= 1
@@ -2076,7 +2076,7 @@ def test_non_auth_attachments_empty_kwa(mockHelpingNowUTC):
 
             # All non-auth attachment dbs empty
             assert receiverHby.db.kramTRQS.get(keys=partialKey) == []
-            assert receiverHby.db.kramTSGS.get(keys=partialKey) == []
+            assert receiverHby.db.kramLSGS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSTS.get(keys=partialKey) == []
             assert receiverHby.db.kramFRCS.get(keys=partialKey) == []
@@ -2134,7 +2134,7 @@ def test_rem_non_auth_attachments(mockHelpingNowUTC):
             # Populate all ten non-auth dbs directly
             receiverHby.db.kramTRQS.add(keys=partialKey,
                                     val=(prefixer, seqner, saider, allSigers[0]))
-            receiverHby.db.kramTSGS.add(keys=partialKey,
+            receiverHby.db.kramLSGS.add(keys=partialKey,
                                     val=(prefixer, seqner, saider, allSigers[0]))
             receiverHby.db.kramSSCS.add(keys=partialKey, val=(seqner, saider))
             receiverHby.db.kramSSTS.add(keys=partialKey, val=(prefixer, seqner, saider))
@@ -2165,7 +2165,7 @@ def test_rem_non_auth_attachments(mockHelpingNowUTC):
 
             # Confirm all populated
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) == 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) == 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSCS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) == 1
@@ -2180,7 +2180,7 @@ def test_rem_non_auth_attachments(mockHelpingNowUTC):
 
             # All ten cleared
             assert receiverHby.db.kramTRQS.get(keys=partialKey) == []
-            assert receiverHby.db.kramTSGS.get(keys=partialKey) == []
+            assert receiverHby.db.kramLSGS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSTS.get(keys=partialKey) == []
             assert receiverHby.db.kramFRCS.get(keys=partialKey) == []
@@ -2201,7 +2201,7 @@ def test_stale_tsgs(mockHelpingNowUTC):
     the current kever. Such stale tsgs are not counted toward the current
     threshold. Historically verified tuples appear in sigResult.stale_tsgs
     from _verifyAttachedSigs for observability only; they are removed from
-    kwa['tsgs'] (not forwarded). kramTSGS does not store sender-addressed tsgs.
+    kwa['tsgs'] (not forwarded). kramLSGS does not store sender-addressed tsgs.
 
     Covers:
         - stale tsg verified against historical key state appears in
@@ -2210,7 +2210,7 @@ def test_stale_tsgs(mockHelpingNowUTC):
           stale_tsgs (ignored) and is scrubbed from kwa
         - fast path (threshold met on first delivery): message accepted; stale
           sender tsgs are not left in kwa for downstream
-        - accumulation path: kramTSGS only stores non-sender tsgs from kwa;
+        - accumulation path: kramLSGS only stores non-sender tsgs from kwa;
           sender-only stale tsgs are not persisted there
     """
 
@@ -2359,7 +2359,7 @@ def test_stale_tsgs(mockHelpingNowUTC):
             kvy.cues.clear()
 
 
-            # Step 3: accumulation path — sender tsgs are not stored in kramTSGS
+            # Step 3: accumulation path — sender tsgs are not stored in kramLSGS
             #
             # First delivery: 1 current-keystate sig (below 2-of-3 threshold)
             # plus one stale tsg. Stale sender tsg is stripped from kwa; only
@@ -2396,8 +2396,8 @@ def test_stale_tsgs(mockHelpingNowUTC):
             pmks3 = receiverHby.db.kramPMKS.get(keys=partialKey3)
             assert len(pmks3) == 1  # only 1 current-keystate sig so far
 
-            # kramTSGS is not populated from sender-only tsgs after verify strip
-            tsgs3 = receiverHby.db.kramTSGS.get(keys=partialKey3)
+            # kramLSGS is not populated from sender-only tsgs after verify strip
+            tsgs3 = receiverHby.db.kramLSGS.get(keys=partialKey3)
             assert tsgs3 is None or len(tsgs3) == 0
 
             assert len(kvy.cues) == 0
@@ -2412,7 +2412,7 @@ def test_stale_tsgs(mockHelpingNowUTC):
             assert len(kvy.cues) > 0
             kvy.cues.clear()
 
-            tsgs3_after = receiverHby.db.kramTSGS.get(keys=partialKey3)
+            tsgs3_after = receiverHby.db.kramLSGS.get(keys=partialKey3)
             assert tsgs3_after is None or len(tsgs3_after) == 0
 
     """Done Test"""
@@ -4820,7 +4820,7 @@ def test_pruning_messages_multi_key(fakeHelpingClock):
             # Non-auth attachment dbs populated (not sscs / not sender ssts)
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) == 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) == 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) == 1
@@ -4850,7 +4850,7 @@ def test_pruning_messages_multi_key(fakeHelpingClock):
 
             # Non auth attachments got cleaned up
             assert receiverHby.db.kramTRQS.get(keys=partialKey) == []
-            assert receiverHby.db.kramTSGS.get(keys=partialKey) == []
+            assert receiverHby.db.kramLSGS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSTS.get(keys=partialKey) == []
             assert receiverHby.db.kramFRCS.get(keys=partialKey) == []
@@ -4947,7 +4947,7 @@ def test_pruning_messages_multi_key(fakeHelpingClock):
             # Non-auth attachment dbs populated (not sscs / not sender ssts)
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) == 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) == 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) == 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) == 1
@@ -4975,7 +4975,7 @@ def test_pruning_messages_multi_key(fakeHelpingClock):
             # Non-auth attachments persist (not sscs)
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert len(receiverHby.db.kramTRQS.get(keys=partialKey)) >= 1
-            assert len(receiverHby.db.kramTSGS.get(keys=partialKey)) >= 1
+            assert len(receiverHby.db.kramLSGS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramSSTS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramFRCS.get(keys=partialKey)) >= 1
             assert len(receiverHby.db.kramTDCS.get(keys=partialKey)) >= 1
@@ -4994,7 +4994,7 @@ def test_pruning_messages_multi_key(fakeHelpingClock):
 
             # Non auth attachments got cleaned up
             assert receiverHby.db.kramTRQS.get(keys=partialKey) == []
-            assert receiverHby.db.kramTSGS.get(keys=partialKey) == []
+            assert receiverHby.db.kramLSGS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSCS.get(keys=partialKey) == []
             assert receiverHby.db.kramSSTS.get(keys=partialKey) == []
             assert receiverHby.db.kramFRCS.get(keys=partialKey) == []
