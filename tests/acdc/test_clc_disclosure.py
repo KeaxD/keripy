@@ -74,12 +74,17 @@ import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from keri import Kinds, Ilks
-from keri.core import (Salter, Noncer, Aggor, Compactor, Mapper, Diger, Verfer,
-                       exchange, messagize, incept, rotate)
+from keri import Vrsn_2_0, Kinds, Ilks
+from keri.core import (Salter, Noncer, Aggor, Blinder, Compactor, Mapper, Diger,
+                       Parser, Verfer, exchange, messagize, incept, rotate)
 from keri.core.coring import MtrDex
 from keri.core.serdering import SerderACDC
-from keri.acdc import regcept, acdcmap, acdcagg
+from keri.acdc import (Regery, Registrar, acdcagg, acdcmap, loadHandlers,
+                       regcept, apply as ipexApply, admit as ipexAdmit,
+                       agree as ipexAgree, grant as ipexGrant,
+                       offer as ipexOffer)
+from keri.app import openHby
+from keri.peer import Exchanger
 
 
 # --- Reproducible example actors (see module docstring). ---
@@ -721,6 +726,71 @@ def _club_accepts_grant(grantedSad, agreedSaid, schema):
         return False
     assert_acdc_schema_valid(granted, schema=schema)
     return True
+
+
+def _assert_current_issued_source_credential(source, carriedState, registry, holder, uuid, states,
+                                             require_head=True):
+    """Verifier-side live check that one disclosed source credential is currently issued.
+
+    This complements `_club_accepts_grant` by checking the source credential's
+    governing registry state instead of only the delivered presentation artifact.
+    It verifies the source and carried state artifacts, confirms the carried
+    blindable update occupies an accepted slot in the registry chain, confirms
+    the update is still anchored in the issuer's KEL, and unblinds that one
+    event with the disclosed per-event nonce (never the root salt) to prove the
+    state is `issued` for this exact credential.
+
+    When a test uses one credential per registry, ``require_head=True`` also
+    asserts that the carried update is the current registry head. Shared
+    registries may set ``require_head=False`` when later updates belong to other
+    credentials in the same registry.
+    """
+    # Check both artifacts are well-formed and self-addressing
+    source = SerderACDC(sad=source.sad, verify=True)
+    carriedState = SerderACDC(sad=carriedState.sad, verify=True)
+
+    # Check that the source credential points to the expected issuer/subject/registry
+    assert source.israid == registry.hab.pre
+    assert source.iseaid == holder
+    assert source.regid == registry.regk
+    assert carriedState.regid == registry.regk
+
+    # Next confirm that the carried blindable update really occupies its claimed
+    # place in the accepted registry chain: it must be a non-inception state
+    # event.
+    sn = int(carriedState.sad["n"], 16)
+    assert sn >= 1
+
+    # Its prior pointer must match the accepted predecessor, and it must be the
+    # accepted event at its claimed sequence number. In one-credential-per-
+    # registry examples we also expect it to remain the current registry head.
+    prior = registry.store.seqEvent(registry.regk, sn - 1)
+    assert prior is not None
+    assert carriedState.sad["p"] == prior.said
+    assert registry.store.seqEvent(registry.regk, sn).said == carriedState.said
+    if require_head:
+        assert registry.store.headEvent(registry.regk).said == carriedState.said
+
+    # Check that this accepted state event is still backed by a real issuer KEL seal. 
+    # Pull the stored anchor couple and re-verify it against the issuer's KEL 
+    # using the registry's own anchor-validation logic.
+    anchor = registry.store.anchor(carriedState.said)
+    assert anchor is not None
+    number, diger = anchor
+    assert registry._verifyAnchor(carriedState, number, diger)
+
+    # Finally prove the content of this one blindable state event. The verifier
+    # is given only the disclosed per-event nonce (`uuid`), never the shared
+    # root salt, so it can unblind just this event and confirm that the current
+    # accepted state is `issued` for this exact source credential.
+    unblinder = Blinder.unblind(said=carriedState.sad["b"],
+                                uuid=uuid,
+                                acdc=source.said,
+                                states=states)
+    assert unblinder is not None
+    assert unblinder.state == "issued"
+    assert unblinder.acdc == source.said
+    return unblinder
 
 
 def test_source_credentials_and_graduated_disclosure_JSON():
@@ -1426,6 +1496,115 @@ FOOD_HANDLER_SCHEMA_MAD = {
     "additionalProperties": False,
 }
 
+PAY_STUB_SCHEMA_MAD = {
+    "$id": "",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Pay Stub Credential",
+    "description": "Employer-issued pay-stub credential linked back to a SEDI "
+                   "core identity via an E1E identity edge.",
+    "credentialType": "PayStub",
+    "version": "1.0.0",
+    "type": "object",
+    "required": ["v", "d", "i", "rd", "s", "a", "e"],
+    "properties": {
+        "v": {"type": "string"},
+        "t": {"const": "acm"},
+        "d": {"type": "string"},
+        "u": {"type": "string"},
+        "i": {"type": "string"},
+        "rd": {"type": "string"},
+        "s": _SAID_OR_SECTION,
+        "a": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "u", "i", "employer", "stubId", "periodStart",
+                              "periodEnd", "grossPay", "netPay", "currency"],
+                 "properties": {
+                     "d": {"type": "string"},
+                     "u": {"type": "string"},
+                     "i": {"type": "string"},
+                     "employer": {"type": "string"},
+                     "stubId": {"type": "string"},
+                     "periodStart": {"type": "string", "format": "date"},
+                     "periodEnd": {"type": "string", "format": "date"},
+                     "grossPay": {"type": "number"},
+                     "netPay": {"type": "number"},
+                     "currency": {"type": "string"},
+                 },
+                 "additionalProperties": False},
+            ],
+        },
+        "e": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "identity"],
+                 "properties": {"d": {"type": "string"},
+                                "u": {"type": "string"},
+                                "identity": _E1E_EDGE_SCHEMA},
+                 "additionalProperties": False},
+            ],
+        },
+        "r": _EMPTY_OR_SECTION,
+    },
+    "additionalProperties": False,
+}
+
+EMPLOYMENT_VERIFICATION_SCHEMA_MAD = {
+    "$id": "",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Employment Verification Credential",
+    "description": "Employer-issued employment verification linked back to a "
+                   "SEDI core identity via an E1E identity edge.",
+    "credentialType": "EmploymentVerification",
+    "version": "1.0.0",
+    "type": "object",
+    "required": ["v", "d", "i", "rd", "s", "a", "e"],
+    "properties": {
+        "v": {"type": "string"},
+        "t": {"const": "acm"},
+        "d": {"type": "string"},
+        "u": {"type": "string"},
+        "i": {"type": "string"},
+        "rd": {"type": "string"},
+        "s": _SAID_OR_SECTION,
+        "a": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "u", "i", "employer", "status", "role",
+                              "startDate", "payFrequency", "annualSalary"],
+                 "properties": {
+                     "d": {"type": "string"},
+                     "u": {"type": "string"},
+                     "i": {"type": "string"},
+                     "employer": {"type": "string"},
+                     "status": {"type": "string"},
+                     "role": {"type": "string"},
+                     "startDate": {"type": "string", "format": "date"},
+                     "payFrequency": {"type": "string"},
+                     "annualSalary": {"type": "number"},
+                 },
+                 "additionalProperties": False},
+            ],
+        },
+        "e": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "identity"],
+                 "properties": {"d": {"type": "string"},
+                                "u": {"type": "string"},
+                                "identity": _E1E_EDGE_SCHEMA},
+                 "additionalProperties": False},
+            ],
+        },
+        "r": _EMPTY_OR_SECTION,
+    },
+    "additionalProperties": False,
+}
+
 JOB_PRESENTATION_SCHEMA_MAD = {
     "$id": "",
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1476,6 +1655,62 @@ JOB_PRESENTATION_SCHEMA_MAD = {
     "additionalProperties": False,
 }
 
+LOAN_PRESENTATION_SCHEMA_MAD = {
+    "$id": "",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Rental and Loan Application Presentation ACDC",
+    "description": "Holder-issued presentation binding one applicant to a SEDI "
+                   "identity subset, two pay stubs, and an employment "
+                   "verification.",
+    "credentialType": "RentalLoanApplicationPresentation",
+    "version": "1.0.0",
+    "type": "object",
+    "required": ["v", "d", "i", "s", "a", "e"],
+    "properties": {
+        "v": {"type": "string"},
+        "t": {"const": "acm"},
+        "d": {"type": "string"},
+        "u": {"type": "string"},
+        "i": {"type": "string"},
+        "s": _SAID_OR_SECTION,
+        "a": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "u", "i", "applicationType", "propertyType",
+                              "monthlyHousingPayment", "submitted"],
+                 "properties": {
+                     "d": {"type": "string"},
+                     "u": {"type": "string"},
+                     "i": {"type": "string"},
+                     "applicationType": {"type": "string"},
+                     "propertyType": {"type": "string"},
+                     "monthlyHousingPayment": {"type": "number"},
+                     "submitted": {"type": "string"},
+                 },
+                 "additionalProperties": False},
+            ],
+        },
+        "e": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "object",
+                 "required": ["d", "identity", "incomePrimary",
+                              "incomeSecondary", "employment"],
+                 "properties": {"d": {"type": "string"},
+                                "u": {"type": "string"},
+                                "identity": _I2I_EDGE_SCHEMA,
+                                "incomePrimary": _I2I_EDGE_SCHEMA,
+                                "incomeSecondary": _I2I_EDGE_SCHEMA,
+                                "employment": _I2I_EDGE_SCHEMA},
+                 "additionalProperties": False},
+            ],
+        },
+        "r": _EMPTY_OR_SECTION,
+    },
+    "additionalProperties": False,
+}
+
 
 JOB_RAWS = [b'jobappdisclosur' + b'%0x' % (i,) for i in range(18)]
 JOB_NONCES = [Noncer(raw=raw).qb64 for raw in JOB_RAWS]
@@ -1483,6 +1718,15 @@ J_SEDI_A, J_SEDI_NAME, J_SEDI_ADDRESS, J_SEDI_PHONE, J_SEDI_BIOMETRIC, J_SEDI_DO
     J_SEDI_ACDC, J_PERMIT_A, J_PERMIT_ACDC, J_PERMIT_E, J_PERMIT_E_ID, J_PRESENT_A, \
     J_PRESENT_ACDC, J_PRESENT_E, J_PRESENT_E_ID, J_PRESENT_E_ENT, J_REG_STATE, \
     J_REG_PERMIT = range(18)
+
+LOAN_RAWS = [b'loanappdisclosu' + b'%0x' % (i,) for i in range(30)]
+LOAN_NONCES = [Noncer(raw=raw).qb64 for raw in LOAN_RAWS]
+L_ID_A, L_ID_NAME, L_ID_ADDRESS, L_ID_PHONE, L_ID_BIOMETRIC, L_ID_DOB, \
+    L_ID_ACDC, L_PAY1_A, L_PAY1_ACDC, L_PAY1_E, L_PAY1_E_ID, L_PAY2_A, \
+    L_PAY2_ACDC, L_PAY2_E, L_PAY2_E_ID, L_EMP_A, L_EMP_ACDC, L_EMP_E, \
+    L_EMP_E_ID, L_PRESENT_A, L_PRESENT_ACDC, L_PRESENT_E, L_PRESENT_E_ID, \
+    L_PRESENT_E_PAY1, L_PRESENT_E_PAY2, L_PRESENT_E_EMP, L_REG_STATE, \
+    L_REG_PAY1, L_REG_PAY2, L_REG_EMP = range(30)
 
 
 def test_job_application_entitlement_presentation_JSON():
@@ -1792,6 +2036,1165 @@ def test_job_application_entitlement_presentation_JSON():
     assert admit.sad['p'] == grant.said
 
 
+def test_job_application_entitlement_presentation_IPEX_blindable_JSON():
+    """Job-application flow: SEDI subset plus linked food-handler entitlement.
+
+    This adapts the data-structure-only example to the live V2 IPEX and
+    blindable-registry code we now have. The employer still asks for one
+    job-application presentation that binds the SEDI identity subset and the
+    food-handler permit, but the two source credentials are now actually issued
+    into blindable registries and their resulting `bup` events are carried in
+    the real `/ipex/grant` message as attached artifacts after the origin.
+
+    The grant therefore transports:
+      * `origin`: the holder-issued compact job-application presentation,
+      * `artifacts[0]`: the SEDI credential's blindable issued-state event, and
+      * `artifacts[1]`: the permit credential's blindable issued-state event.
+
+    The mixed SEDI subset and entitlement disclosure still ride in the grant
+    body, so the club receives the same application fields as before while the
+    test now also proves the source credentials are in the expected blindable
+    registry state.
+    """
+    kind = Kinds.json
+    states = ["issued", "revoked"]
+
+    with openHby(name="ipex-job-application-entitlement",
+                 base="test",
+                 version=Vrsn_2_0) as hby:
+        stateHab = hby.makeHab(name="state", version=Vrsn_2_0, kind=kind)
+        endorserHab = hby.makeHab(name="endorser", version=Vrsn_2_0, kind=kind)
+        aliceHab = hby.makeHab(name="alice", version=Vrsn_2_0, kind=kind)
+        clubHab = hby.makeHab(name="club", version=Vrsn_2_0, kind=kind)
+        rgy = Regery(hby=hby, name="ipex-job-application-entitlement", temp=True)
+        try:
+            def anchor(hab, registry, serder, *, framed=False):
+                seal = dict(i=registry.regk, s=serder.sad["n"], d=serder.said)
+                anc = hab.interact(data=[seal], framed=framed, gvrsn=Vrsn_2_0)
+                assert registry.anchorMsg(serder.said) is True
+                return anc
+
+            class Recorder:
+                def __init__(self):
+                    self.items = []
+
+                def add(self, attrs):
+                    self.items.append(attrs)
+
+            registrar = Registrar(rgy=rgy)
+
+            # Create the two source blindable registries and anchor their `rip` events.
+            stateRegistry = registrar.makeRegistry(name="job-state",
+                                                   prefix=stateHab.pre,
+                                                   uuid=JOB_NONCES[J_REG_STATE],
+                                                   stamp="2026-03-10T12:00:00.000000+00:00")
+            stateRip = rgy.store.event(stateRegistry.regk)
+            anchor(stateHab, stateRegistry, stateRip, framed=True)
+
+            permitRegistry = registrar.makeRegistry(name="job-permit",
+                                                    prefix=endorserHab.pre,
+                                                    uuid=JOB_NONCES[J_REG_PERMIT],
+                                                    stamp="2026-03-11T12:00:00.000000+00:00")
+            permitRip = rgy.store.event(permitRegistry.regk)
+            anchor(endorserHab, permitRegistry, permitRip, framed=True)
+
+            # Build self-addressed schemas for the two source credentials and the
+            # holder-issued presentation.
+            _, jobSediSchema = _saidify_schema(dict(JOB_SEDI_SCHEMA_MAD), kind=kind)
+            _, permitSchema = _saidify_schema(dict(FOOD_HANDLER_SCHEMA_MAD), kind=kind)
+            _, presentationSchema = _saidify_schema(dict(JOB_PRESENTATION_SCHEMA_MAD),
+                                                    kind=kind)
+
+            # Build the employment-oriented SEDI source credential. The nested blocks
+            # let the holder reveal name/address/phone/biometric later while
+            # withholding DOB.
+            sedi = acdcmap(
+                israid=stateHab.pre,
+                uuid=JOB_NONCES[J_SEDI_ACDC],
+                regid=stateRegistry.regk,
+                schema=jobSediSchema,
+                attribute=dict(
+                    d='',
+                    u=JOB_NONCES[J_SEDI_A],
+                    i=aliceHab.pre,
+                    legalName=dict(d='', u=JOB_NONCES[J_SEDI_NAME],
+                                   legalName="Alice Anders"),
+                    address=dict(d='', u=JOB_NONCES[J_SEDI_ADDRESS],
+                                 address="220 E 300 S, Salt Lake City UT 84111"),
+                    phone=dict(d='', u=JOB_NONCES[J_SEDI_PHONE],
+                               phone="+1-801-555-0100"),
+                    biometric=dict(d='', u=JOB_NONCES[J_SEDI_BIOMETRIC],
+                                   biometric="face-template-sha256:4d0ff9ce-job-app"),
+                    dob=dict(d='', u=JOB_NONCES[J_SEDI_DOB], dob="2000-03-15"),
+                ),
+                iseaid=aliceHab.pre,
+                kind=kind,
+            )
+
+            # Build the entitlement credential and chain it back to the SEDI
+            # credential with an E1E identity edge.
+            permit = acdcmap(
+                israid=endorserHab.pre,
+                uuid=JOB_NONCES[J_PERMIT_ACDC],
+                regid=permitRegistry.regk,
+                schema=permitSchema,
+                attribute=dict(d='', u=JOB_NONCES[J_PERMIT_A], i=aliceHab.pre,
+                               permitId="UT-FH-2026-00917",
+                               category="food-handler",
+                               status="active",
+                               expires="2027-08-31",
+                               jurisdiction="Salt Lake County Health Department"),
+                edge=dict(d='', u=JOB_NONCES[J_PERMIT_E],
+                          identity=dict(d='', u=JOB_NONCES[J_PERMIT_E_ID], n=sedi.said,
+                                        s=sedi.sad['s']['$id'], o='E1E')),
+                kind=kind,
+            )
+
+            # Build the expanded and compact holder-issued presentation that binds
+            # both source credentials to this one job-application flow.
+            presentation = acdcmap(
+                israid=aliceHab.pre,
+                uuid=JOB_NONCES[J_PRESENT_ACDC],
+                schema=presentationSchema,
+                attribute=dict(d='', u=JOB_NONCES[J_PRESENT_A], i=clubHab.pre,
+                               role="crew-member / food-handler",
+                               employer="Downtown Burger",
+                               submitted="2026-08-04"),
+                edge=dict(
+                    d='',
+                    u=JOB_NONCES[J_PRESENT_E],
+                    identity=dict(d='', u=JOB_NONCES[J_PRESENT_E_ID], n=sedi.said,
+                                  s=sedi.sad['s']['$id'], o='I2I'),
+                    entitlement=dict(d='', u=JOB_NONCES[J_PRESENT_E_ENT], n=permit.said,
+                                     s=permit.sad['s']['$id'], o='I2I'),
+                ),
+                kind=kind,
+            )
+            presentationCompact = acdcmap(
+                israid=aliceHab.pre,
+                uuid=JOB_NONCES[J_PRESENT_ACDC],
+                schema=presentationSchema,
+                attribute=dict(d='', u=JOB_NONCES[J_PRESENT_A], i=clubHab.pre,
+                               role="crew-member / food-handler",
+                               employer="Downtown Burger",
+                               submitted="2026-08-04"),
+                edge=dict(
+                    d='',
+                    u=JOB_NONCES[J_PRESENT_E],
+                    identity=dict(d='', u=JOB_NONCES[J_PRESENT_E_ID], n=sedi.said,
+                                  s=sedi.sad['s']['$id'], o='I2I'),
+                    entitlement=dict(d='', u=JOB_NONCES[J_PRESENT_E_ENT], n=permit.said,
+                                     s=permit.sad['s']['$id'], o='I2I'),
+                ),
+                kind=kind,
+                compactify=True,
+            )
+
+            # Validate every artifact and assert the presentation binds one holder
+            # to one identity credential and one entitlement credential.
+            assert_acdc_schema_valid(sedi)
+            assert_acdc_schema_valid(permit)
+            presentationSchemaExpanded = assert_acdc_schema_valid(presentation)
+            assert_acdc_schema_valid(presentationCompact, schema=presentationSchemaExpanded)
+            assert presentation.said == presentationCompact.said
+            assert presentation.sad['i'] == aliceHab.pre
+            assert presentation.sad['a']['i'] == clubHab.pre
+            assert sedi.iseaid == permit.iseaid == aliceHab.pre
+            assert presentation.sad['e']['identity']['o'] == 'I2I'
+            assert presentation.sad['e']['entitlement']['o'] == 'I2I'
+            assert sedi.sad['rd'] == stateRegistry.regk
+            assert permit.sad['rd'] == permitRegistry.regk
+            assert _verify_identity_edge(permit, sedi, sedi.sad['s']['$id'])
+
+            # Issue both source credentials into blindable registries and assert
+            # their accepted `bup` state is `issued`.
+            sediSalt = Noncer(raw=b'jobappsedi-regsalt').qb64
+            permitSalt = Noncer(raw=b'jobapppermitsalt').qb64
+
+            sediBlinder, sediBup = registrar.issue(stateRegistry, acdc=sedi,
+                                                   state="issued", salt=sediSalt)
+            anchor(stateHab, stateRegistry, sediBup, framed=False)
+            permitBlinder, permitBup = registrar.issue(permitRegistry, acdc=permit,
+                                                       state="issued", salt=permitSalt)
+            anchor(endorserHab, permitRegistry, permitBup, framed=False)
+
+            assert rgy.store.seqEvent(stateRegistry.regk, 0).said == stateRip.said
+            assert rgy.store.seqEvent(stateRegistry.regk, 1).said == sediBup.said
+            assert rgy.store.headEvent(stateRegistry.regk).said == sediBup.said
+            assert sediBup.sad["rd"] == stateRegistry.regk
+            assert sediBup.sad["p"] == stateRip.said
+            assert sediBup.sad["b"] == sediBlinder.said
+            assert Blinder.unblind(said=sediBup.sad["b"], acdc=sedi.said,
+                                   states=states, salt=sediSalt, sn=1).state == "issued"
+
+            assert rgy.store.seqEvent(permitRegistry.regk, 0).said == permitRip.said
+            assert rgy.store.seqEvent(permitRegistry.regk, 1).said == permitBup.said
+            assert rgy.store.headEvent(permitRegistry.regk).said == permitBup.said
+            assert permitBup.sad["rd"] == permitRegistry.regk
+            assert permitBup.sad["p"] == permitRip.said
+            assert permitBup.sad["b"] == permitBlinder.said
+            assert Blinder.unblind(said=permitBup.sad["b"], acdc=permit.said,
+                                   states=states, salt=permitSalt, sn=1).state == "issued"
+
+            # Build the employer's disclosure-plan request in breadth-first order
+            # from the presentation DAG's origin node. Each entry is a compact
+            # triple:
+            #   (schema SAID, DAG-absolute path prefix, list of ACDC-relative paths)
+            # The _ component is the virtual DAG hop from an edge block to the far ACDC.
+            requestedDp = [
+                (presentation.sad['s']['$id'], "/", [
+                    "i",
+                    "a/i",
+                    "a/role",
+                    "a/employer",
+                    "a/submitted",
+                ]),
+                (sedi.sad['s']['$id'], "/e/identity/_/", [
+                    "i",
+                    "a/i",
+                    "a/legalName",
+                    "a/address",
+                    "a/phone",
+                    "a/biometric",
+                ]),
+                (permit.sad['s']['$id'], "/e/entitlement/_/", [
+                    "i",
+                    "a/i",
+                    "a/permitId",
+                    "a/category",
+                    "a/status",
+                    "a/expires",
+                    "e/identity/n",
+                    "e/identity/s",
+                ]),
+            ]
+
+            recorder = Recorder()
+            exc = Exchanger(hby=hby, handlers=[])
+            loadHandlers(hby=hby, exc=exc, notifier=recorder)
+
+            # Build a real V2 IPEX linear flow. The offer carries only the
+            # disclosure-plan contract; the final grant carries the presentation
+            # as origin plus the two source blindable state artifacts and the
+            # actual mixed disclosure.
+            apply, applyAtc = ipexApply(
+                hab=clubHab,
+                recp=aliceHab.pre,
+                message="Show the SEDI identity subset and the linked food-handler permit.",
+                attrs={},
+                dt="2026-08-04T15:00:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                modifiers=dict(dp=requestedDp),
+            )
+
+            offer, offerAtc = ipexOffer(
+                hab=aliceHab,
+                message="Here is the one-time job-application presentation.",
+                apply=apply,
+                dt="2026-08-04T15:01:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                modifiers=dict(dp=[]),
+            )
+
+            agree, agreeAtc = ipexAgree(
+                hab=clubHab,
+                message="I agree to the one-time job-application disclosure terms.",
+                offer=offer,
+                dt="2026-08-04T15:02:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+            )
+
+            identityCompactor = Compactor(mad=dict(sedi.sad['a']), makify=True, kind=kind)
+            identityCompactor.compact()
+            identityCompactor.expand(greedy=True)
+            identityDisclosure = dict(identityCompactor.partials[('',)].mad)
+            for field in ("legalName", "address", "phone", "biometric"):
+                identityDisclosure[field] = sedi.sad['a'][field]
+
+            grant, grantAtc = ipexGrant(
+                hab=aliceHab,
+                recp=clubHab.pre,
+                message="Here is the job-application presentation and the linked issued credentials.",
+                origin=presentationCompact,
+                artifacts=[sediBup, permitBup],
+                agree=agree,
+                dt="2026-08-04T15:03:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                attrs=dict(
+                    identity=identityDisclosure,
+                    entitlement=dict(a=dict(permit.sad['a']), e=dict(permit.sad['e'])),
+                ),
+            )
+
+            admit, admitAtc = ipexAdmit(
+                hab=clubHab,
+                message="Received the job-application presentation and linked issued credentials.",
+                grant=grant,
+                dt="2026-08-04T15:04:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+            )
+
+            # The apply still carries the expected breadth-first disclosure-plan triples.
+            assert apply.sad['r'] == "/ipex/apply"
+            assert apply.sad['q']['dp'] == requestedDp
+            assert apply.sad['q']['dp'][0][0] == presentation.sad['s']['$id']
+            assert apply.sad['q']['dp'][0][1] == "/"
+            assert apply.sad['q']['dp'][1][1] == "/e/identity/_/"
+            assert apply.sad['q']['dp'][2][1] == "/e/entitlement/_/"
+
+            # The offer binds the apply and still carries no disclosed identity data.
+            assert offer.sad['p'] == apply.said
+            assert offer.sad['q']['dp'] == []
+            offerWire = bytes(offer.raw) + bytes(offerAtc)
+            assert b"Alice Anders" not in offerWire
+            assert b"220 E 300 S" not in offerWire
+            assert b"+1-801-555-0100" not in offerWire
+            assert b"2000-03-15" not in offerWire
+
+            offerIms = bytearray(offer.raw)
+            offerIms.extend(offerAtc)
+            offerResults = Parser(version=Vrsn_2_0).parse(ims=offerIms,
+                                                          framed=False,
+                                                          processive=False)
+            assert offerIms == bytearray()
+            assert len(offerResults) == 1
+            assert offerResults[0].nests == []
+
+            # The real grant should follow the agree and disclose only the
+            # intended SEDI subset while carrying the two source blindable state events.
+            assert grant.sad['r'] == "/ipex/grant"
+            assert grant.sad['p'] == agree.said
+            grantWire = bytes(grant.raw) + bytes(grantAtc)
+            assert b"Alice Anders" in grantWire
+            assert b"220 E 300 S" in grantWire
+            assert b"+1-801-555-0100" in grantWire
+            assert b"face-template-sha256:4d0ff9ce-job-app" in grantWire
+            assert b"2000-03-15" not in grantWire
+            assert b"revoked" not in grantWire
+
+            grantIms = bytearray(grant.raw)
+            grantIms.extend(grantAtc)
+            grantResults = Parser(version=Vrsn_2_0).parse(ims=grantIms,
+                                                          framed=False,
+                                                          processive=False)
+            assert grantIms == bytearray()
+            assert len(grantResults) == 1
+            grantResult = grantResults[0]
+            assert [nest.serder.said for nest in grantResult.nests] == [
+                presentationCompact.said,
+                sediBup.said,
+                permitBup.said,
+            ]
+            assert grantResult.serder.ked["i"] == aliceHab.pre
+            assert grantResult.serder.ked["ri"] == clubHab.pre
+
+            carriedPresentation = grantResult.nests[0].serder
+            carriedSediBup = grantResult.nests[1].serder
+            carriedPermitBup = grantResult.nests[2].serder
+            assert b"issued" not in carriedSediBup.raw
+            assert b"issued" not in carriedPermitBup.raw
+            assert b"revoked" not in carriedSediBup.raw
+            assert b"revoked" not in carriedPermitBup.raw
+
+            # The employer can validate the compact presentation against the
+            # artifact committed for disclosure by the offer/agree path.
+            assert _club_accepts_grant(carriedPresentation.sad, presentation.said,
+                                       presentationSchemaExpanded)
+            assert carriedPresentation.sad["i"] == aliceHab.pre
+            assert isinstance(carriedPresentation.sad["a"], str)
+            assert isinstance(carriedPresentation.sad["e"], str)
+
+            # The disclosed identity subset reveals the requested fields but
+            # leaves DOB compacted as a bare SAID.
+            grantAttrs = grantResult.serder.sad['a']
+            identityDisc = grantAttrs['identity']
+            assert identityDisc['i'] == aliceHab.pre
+            assert isinstance(identityDisc['legalName'], dict)
+            assert isinstance(identityDisc['address'], dict)
+            assert isinstance(identityDisc['phone'], dict)
+            assert isinstance(identityDisc['biometric'], dict)
+            assert isinstance(identityDisc['dob'], str)
+            identityCheck = Compactor(mad=dict(identityDisc, d=''),
+                                      makify=True,
+                                      kind=kind)
+            identityCheck.compact()
+            assert identityCheck.said == _committed_a_said(sedi, kind)
+
+            # The entitlement disclosure still carries the permit data plus the
+            # E1E edge that chains it back to the original SEDI credential.
+            entitlementDisc = grantAttrs['entitlement']
+            assert entitlementDisc['a']['i'] == aliceHab.pre
+            assert entitlementDisc['a']['permitId'] == "UT-FH-2026-00917"
+            assert entitlementDisc['a']['category'] == "food-handler"
+            assert entitlementDisc['a']['status'] == "active"
+            assert entitlementDisc['e']['identity']['o'] == 'E1E'
+            assert entitlementDisc['e']['identity']['n'] == sedi.said
+            assert entitlementDisc['e']['identity']['s'] == sedi.sad['s']['$id']
+
+            # Production-grade source-credential verification: each transported
+            # blindable update must be the live accepted head of its source
+            # registry, still anchored in the issuer's KEL, and unblind to the
+            # current `issued` state for the exact disclosed credential using
+            # only the per-event nonce revealed to the verifier.
+            carriedSediUnblinder = _assert_current_issued_source_credential(
+                source=sedi,
+                carriedState=carriedSediBup,
+                registry=stateRegistry,
+                holder=aliceHab.pre,
+                uuid=sediBlinder.uuid,
+                states=states,
+            )
+            assert carriedSediBup.sad["b"] == sediBlinder.said
+            assert carriedSediUnblinder.crew == sediBlinder.crew
+
+            carriedPermitUnblinder = _assert_current_issued_source_credential(
+                source=permit,
+                carriedState=carriedPermitBup,
+                registry=permitRegistry,
+                holder=aliceHab.pre,
+                uuid=permitBlinder.uuid,
+                states=states,
+            )
+            assert carriedPermitBup.sad["b"] == permitBlinder.said
+            assert carriedPermitUnblinder.crew == permitBlinder.crew
+
+            # Dispatch the full linear flow through the real IPEX handlers and
+            # confirm the accepted exchanges are stored.
+            for exn, atc in ((apply, applyAtc),
+                             (offer, offerAtc),
+                             (agree, agreeAtc),
+                             (grant, grantAtc),
+                             (admit, admitAtc)):
+                ims = bytearray(exn.raw)
+                ims.extend(atc)
+                Parser(version=Vrsn_2_0).parse(ims=ims, framed=False, exc=exc)
+                assert ims == bytearray()
+                assert hby.db.exns.get(keys=(exn.said,)) is not None
+
+            storedGrant = hby.db.exns.get(keys=(grant.said,))
+            assert storedGrant.ked['a']['o'] == presentationCompact.said
+            assert 'iss' not in storedGrant.ked['a']
+            assert 'anc' not in storedGrant.ked['a']
+            assert storedGrant.ked['a']['identity'] == identityDisclosure
+            assert storedGrant.ked['a']['entitlement'] == dict(
+                a=dict(permit.sad['a']),
+                e=dict(permit.sad['e']),
+            )
+            assert storedGrant.ked['a']['m'] == "Here is the job-application presentation and the linked issued credentials."
+            assert storedGrant.ked['a'] == dict(
+                m="Here is the job-application presentation and the linked issued credentials.",
+                o=presentationCompact.said,
+                identity=identityDisclosure,
+                entitlement=dict(a=dict(permit.sad['a']), e=dict(permit.sad['e'])),
+            )
+
+            assert [(item["r"], item["m"]) for item in recorder.items] == [
+                ("/exn/ipex/apply",
+                 "Show the SEDI identity subset and the linked food-handler permit."),
+                ("/exn/ipex/offer",
+                 "Here is the one-time job-application presentation."),
+                ("/exn/ipex/agree",
+                 "I agree to the one-time job-application disclosure terms."),
+                ("/exn/ipex/grant",
+                 "Here is the job-application presentation and the linked issued credentials."),
+                ("/exn/ipex/admit",
+                 "Received the job-application presentation and linked issued credentials."),
+            ]
+        finally:
+            rgy.close()
+
+
+def test_rental_loan_application_two_pay_stubs_IPEX_blindable_JSON():
+    """Rental/loan flow: one identity, two pay stubs, one employment verification.
+
+    This extends the job-application coverage in two useful ways:
+
+      * the holder-issued presentation references TWO source credentials that
+        share the SAME schema (two pay stubs) at different DAG paths, and
+      * the final V2 grant carries multiple attached blindable state artifacts
+        and multiple anchoring KEL events together.
+
+    Workflow at the test level:
+      1. The lender asks for exactly the income and identity evidence needed for
+         underwriting.
+      2. The holder previews a one-time application presentation without
+         leaking any disclosed values yet.
+      3. The holder releases the actual identity subset, both pay stubs, and
+         the employment verification only after the lender signs agree.
+
+    The repeated pay-stub edges are the main regression target here: they make
+    sure the disclosure plan, the holder-issued presentation, and the final
+    grant all preserve path identity instead of collapsing repeated
+    same-schema artifacts into one bucket.
+    """
+    kind = Kinds.json
+    states = ["issued", "revoked"]
+
+    with openHby(name="ipex-rental-loan-two-paystubs",
+                 base="test",
+                 version=Vrsn_2_0) as hby:
+        stateHab = hby.makeHab(name="state", version=Vrsn_2_0, kind=kind)
+        employerHab = hby.makeHab(name="employer", version=Vrsn_2_0, kind=kind)
+        aliceHab = hby.makeHab(name="alice", version=Vrsn_2_0, kind=kind)
+        lenderHab = hby.makeHab(name="lender", version=Vrsn_2_0, kind=kind)
+        rgy = Regery(hby=hby, name="ipex-rental-loan-two-paystubs", temp=True)
+        try:
+            def anchor(hab, registry, serder, *, framed=False):
+                seal = dict(i=registry.regk, s=serder.sad["n"], d=serder.said)
+                anc = hab.interact(data=[seal], framed=framed, gvrsn=Vrsn_2_0)
+                assert registry.anchorMsg(serder.said) is True
+                return anc
+
+            def event_serder(stream):
+                ims = bytearray(stream)
+                results = Parser(version=Vrsn_2_0).parse(ims=ims,
+                                                         framed=False,
+                                                         processive=False)
+                assert ims == bytearray()
+                assert len(results) == 1
+                return results[0].serder
+
+            class Recorder:
+                def __init__(self):
+                    self.items = []
+
+                def add(self, attrs):
+                    self.items.append(attrs)
+
+            registrar = Registrar(rgy=rgy)
+
+            # Create three blindable registries: one for the applicant
+            # identity, one shared employer payroll registry for both pay
+            # stubs, and one for the employment verification.
+            identityRegistry = registrar.makeRegistry(
+                name="loan-identity",
+                prefix=stateHab.pre,
+                uuid=LOAN_NONCES[L_REG_STATE],
+                stamp="2026-02-10T12:00:00.000000+00:00",
+            )
+            payrollRegistry = registrar.makeRegistry(
+                name="loan-payroll",
+                prefix=employerHab.pre,
+                uuid=LOAN_NONCES[L_REG_PAY1],
+                stamp="2026-02-11T12:00:00.000000+00:00",
+            )
+            employmentRegistry = registrar.makeRegistry(
+                name="loan-employment",
+                prefix=employerHab.pre,
+                uuid=LOAN_NONCES[L_REG_EMP],
+                stamp="2026-02-13T12:00:00.000000+00:00",
+            )
+
+            # Anchor each `rip` event so every source credential below is bound
+            # to a live registry with an issuer KEL seal before any issuance
+            # state is created.
+            anchor(stateHab, identityRegistry, rgy.store.event(identityRegistry.regk), framed=True)
+            anchor(employerHab, payrollRegistry, rgy.store.event(payrollRegistry.regk), framed=True)
+            anchor(employerHab, employmentRegistry, rgy.store.event(employmentRegistry.regk), framed=True)
+
+            # Build self-addressed schemas for the four source credentials and
+            # the holder-issued presentation. The applicant identity reuses the
+            # employment-focused SEDI subset from the job-application flow,
+            # while the two income artifacts deliberately share the same pay
+            # stub schema to stress repeated same-schema edges.
+            _, applicantSchema = _saidify_schema(dict(JOB_SEDI_SCHEMA_MAD), kind=kind)
+            _, payStubSchema = _saidify_schema(dict(PAY_STUB_SCHEMA_MAD), kind=kind)
+            _, employmentSchema = _saidify_schema(dict(EMPLOYMENT_VERIFICATION_SCHEMA_MAD),
+                                                  kind=kind)
+            _, presentationSchema = _saidify_schema(dict(LOAN_PRESENTATION_SCHEMA_MAD),
+                                                    kind=kind)
+
+            # Build the applicant identity credential as a graduated-disclosure
+            # SEDI subset. Like the job-application flow, the lender will later
+            # receive only the requested identity fields while DOB and biometric
+            # remain compacted.
+            applicant = acdcmap(
+                israid=stateHab.pre,
+                uuid=LOAN_NONCES[L_ID_ACDC],
+                regid=identityRegistry.regk,
+                schema=applicantSchema,
+                attribute=dict(
+                    d='',
+                    u=LOAN_NONCES[L_ID_A],
+                    legalName=dict(d='', u=LOAN_NONCES[L_ID_NAME],
+                                   legalName="Alice Anders"),
+                    address=dict(d='', u=LOAN_NONCES[L_ID_ADDRESS],
+                                 address="220 E 300 S, Salt Lake City UT 84111"),
+                    phone=dict(d='', u=LOAN_NONCES[L_ID_PHONE],
+                               phone="+1-801-555-0100"),
+                    biometric=dict(d='', u=LOAN_NONCES[L_ID_BIOMETRIC],
+                                   biometric="face-template-sha256:loan-app"),
+                    dob=dict(d='', u=LOAN_NONCES[L_ID_DOB], dob="2000-03-15"),
+                ),
+                iseaid=aliceHab.pre,
+                kind=kind,
+            )
+            # Build two pay stubs that intentionally share the SAME schema and
+            # issuer but represent distinct source credentials. The two I2I
+            # edges in the final presentation must therefore preserve path
+            # identity (`incomePrimary` vs `incomeSecondary`) rather than rely
+            # on schema identity alone.
+            payStub1 = acdcmap(
+                israid=employerHab.pre,
+                uuid=LOAN_NONCES[L_PAY1_ACDC],
+                regid=payrollRegistry.regk,
+                schema=payStubSchema,
+                attribute=dict(d='', u=LOAN_NONCES[L_PAY1_A], i=aliceHab.pre,
+                               employer="Wasatch Market",
+                               stubId="WM-2026-07-15",
+                               periodStart="2026-07-01",
+                               periodEnd="2026-07-15",
+                               grossPay=2420.50,
+                               netPay=1856.40,
+                               currency="USD"),
+                edge=dict(d='', u=LOAN_NONCES[L_PAY1_E],
+                          identity=dict(d='', u=LOAN_NONCES[L_PAY1_E_ID], n=applicant.said,
+                                        s=applicant.sad['s']['$id'], o='E1E')),
+                kind=kind,
+            )
+            payStub2 = acdcmap(
+                israid=employerHab.pre,
+                uuid=LOAN_NONCES[L_PAY2_ACDC],
+                regid=payrollRegistry.regk,
+                schema=payStubSchema,
+                attribute=dict(d='', u=LOAN_NONCES[L_PAY2_A], i=aliceHab.pre,
+                               employer="Wasatch Market",
+                               stubId="WM-2026-07-31",
+                               periodStart="2026-07-16",
+                               periodEnd="2026-07-31",
+                               grossPay=2450.75,
+                               netPay=1880.15,
+                               currency="USD"),
+                edge=dict(d='', u=LOAN_NONCES[L_PAY2_E],
+                          identity=dict(d='', u=LOAN_NONCES[L_PAY2_E_ID], n=applicant.said,
+                                        s=applicant.sad['s']['$id'], o='E1E')),
+                kind=kind,
+            )
+            # The employer also issues one employment-verification credential
+            # that independently chains back to the same applicant identity.
+            employment = acdcmap(
+                israid=employerHab.pre,
+                uuid=LOAN_NONCES[L_EMP_ACDC],
+                regid=employmentRegistry.regk,
+                schema=employmentSchema,
+                attribute=dict(d='', u=LOAN_NONCES[L_EMP_A], i=aliceHab.pre,
+                               employer="Wasatch Market",
+                               status="active",
+                               role="Operations Supervisor",
+                               startDate="2021-04-12",
+                               payFrequency="semi-monthly",
+                               annualSalary=65500.00),
+                edge=dict(d='', u=LOAN_NONCES[L_EMP_E],
+                          identity=dict(d='', u=LOAN_NONCES[L_EMP_E_ID], n=applicant.said,
+                                        s=applicant.sad['s']['$id'], o='E1E')),
+                kind=kind,
+            )
+            # Build the expanded and compact holder-issued presentation that
+            # binds the lender to one application instance and points to the
+            # identity credential, two pay stubs, and one employment proof.
+            # The compact form is what rides on the wire inside the final grant.
+            presentation = acdcmap(
+                israid=aliceHab.pre,
+                uuid=LOAN_NONCES[L_PRESENT_ACDC],
+                schema=presentationSchema,
+                attribute=dict(d='', u=LOAN_NONCES[L_PRESENT_A], i=lenderHab.pre,
+                               applicationType="rental and loan pre-qualification",
+                               propertyType="two-bedroom apartment",
+                               monthlyHousingPayment=1850.00,
+                               submitted="2026-08-10"),
+                edge=dict(
+                    d='',
+                    u=LOAN_NONCES[L_PRESENT_E],
+                    identity=dict(d='', u=LOAN_NONCES[L_PRESENT_E_ID], n=applicant.said,
+                                  s=applicant.sad['s']['$id'], o='I2I'),
+                    incomePrimary=dict(d='', u=LOAN_NONCES[L_PRESENT_E_PAY1], n=payStub1.said,
+                                       s=payStub1.sad['s']['$id'], o='I2I'),
+                    incomeSecondary=dict(d='', u=LOAN_NONCES[L_PRESENT_E_PAY2], n=payStub2.said,
+                                         s=payStub2.sad['s']['$id'], o='I2I'),
+                    employment=dict(d='', u=LOAN_NONCES[L_PRESENT_E_EMP], n=employment.said,
+                                    s=employment.sad['s']['$id'], o='I2I'),
+                ),
+                kind=kind,
+            )
+            presentationCompact = acdcmap(
+                israid=aliceHab.pre,
+                uuid=LOAN_NONCES[L_PRESENT_ACDC],
+                schema=presentationSchema,
+                attribute=dict(d='', u=LOAN_NONCES[L_PRESENT_A], i=lenderHab.pre,
+                               applicationType="rental and loan pre-qualification",
+                               propertyType="two-bedroom apartment",
+                               monthlyHousingPayment=1850.00,
+                               submitted="2026-08-10"),
+                edge=dict(
+                    d='',
+                    u=LOAN_NONCES[L_PRESENT_E],
+                    identity=dict(d='', u=LOAN_NONCES[L_PRESENT_E_ID], n=applicant.said,
+                                  s=applicant.sad['s']['$id'], o='I2I'),
+                    incomePrimary=dict(d='', u=LOAN_NONCES[L_PRESENT_E_PAY1], n=payStub1.said,
+                                       s=payStub1.sad['s']['$id'], o='I2I'),
+                    incomeSecondary=dict(d='', u=LOAN_NONCES[L_PRESENT_E_PAY2], n=payStub2.said,
+                                         s=payStub2.sad['s']['$id'], o='I2I'),
+                    employment=dict(d='', u=LOAN_NONCES[L_PRESENT_E_EMP], n=employment.said,
+                                    s=employment.sad['s']['$id'], o='I2I'),
+                ),
+                kind=kind,
+                compactify=True,
+            )
+
+            # Validate every artifact and pin the intended graph shape. The two
+            # pay stubs must share one schema SAID yet remain distinct ACDCs
+            # with their own E1E identity edges and their own later I2I paths
+            # from the holder-issued presentation.
+            assert_acdc_schema_valid(applicant)
+            assert_acdc_schema_valid(payStub1)
+            assert_acdc_schema_valid(payStub2)
+            assert_acdc_schema_valid(employment)
+
+            presentationSchemaExpanded = assert_acdc_schema_valid(presentation)
+            assert_acdc_schema_valid(presentationCompact, schema=presentationSchemaExpanded)
+
+            assert presentation.said == presentationCompact.said
+            assert payStub1.sad['s']['$id'] == payStub2.sad['s']['$id']
+            assert payStub1.sad['e']['identity']['o'] == 'E1E'
+            assert payStub2.sad['e']['identity']['o'] == 'E1E'
+            assert employment.sad['e']['identity']['o'] == 'E1E'
+
+            assert _verify_identity_edge(payStub1, applicant, applicant.sad['s']['$id'])
+            assert _verify_identity_edge(payStub2, applicant, applicant.sad['s']['$id'])
+            assert _verify_identity_edge(employment, applicant, applicant.sad['s']['$id'])
+
+            assert presentation.sad['i'] == aliceHab.pre
+            assert presentation.sad['a']['i'] == lenderHab.pre
+            assert presentation.sad['e']['identity']['o'] == 'I2I'
+            assert presentation.sad['e']['incomePrimary']['o'] == 'I2I'
+            assert presentation.sad['e']['incomeSecondary']['o'] == 'I2I'
+            assert presentation.sad['e']['employment']['o'] == 'I2I'
+            assert presentation.sad['e']['incomePrimary']['s'] == payStub1.sad['s']['$id']
+            assert presentation.sad['e']['incomeSecondary']['s'] == payStub2.sad['s']['$id']
+
+            # Issue all four source credentials into their blindable registries
+            # and capture the KEL anchors for the resulting `bup` events. The
+            # final grant will carry BOTH lists:
+            #   * `iss`: the blindable state updates proving current issued state
+            #   * `anc`: the KEL events that anchor those updates
+            applicantBlinder, applicantBup = registrar.issue(
+                identityRegistry,
+                acdc=applicant,
+                state="issued",
+                salt=Noncer(raw=b'loanapplicant-blind').qb64,
+            )
+            applicantAnc = anchor(stateHab, identityRegistry, applicantBup, framed=False)
+            payStub1Blinder, payStub1Bup = registrar.issue(
+                payrollRegistry,
+                acdc=payStub1,
+                state="issued",
+                salt=Noncer(raw=b'loanpaystuboneblnd').qb64,
+            )
+            payStub1Anc = anchor(employerHab, payrollRegistry, payStub1Bup, framed=False)
+            payStub2Blinder, payStub2Bup = registrar.issue(
+                payrollRegistry,
+                acdc=payStub2,
+                state="issued",
+                salt=Noncer(raw=b'loanpaystubtwoblnd').qb64,
+            )
+            payStub2Anc = anchor(employerHab, payrollRegistry, payStub2Bup, framed=False)
+            employmentBlinder, employmentBup = registrar.issue(
+                employmentRegistry,
+                acdc=employment,
+                state="issued",
+                salt=Noncer(raw=b'loanemployverifybd').qb64,
+            )
+            employmentAnc = anchor(employerHab, employmentRegistry, employmentBup, framed=False)
+
+            applicantAncSerder = event_serder(applicantAnc)
+            payStub1AncSerder = event_serder(payStub1Anc)
+            payStub2AncSerder = event_serder(payStub2Anc)
+            employmentAncSerder = event_serder(employmentAnc)
+
+            # The shared payroll registry should now show a clean
+            # rip -> payStub1 issued -> payStub2 issued chain.
+            assert rgy.store.seqEvent(payrollRegistry.regk, 0).said == rgy.store.event(payrollRegistry.regk).said
+            assert rgy.store.seqEvent(payrollRegistry.regk, 1).said == payStub1Bup.said
+            assert rgy.store.seqEvent(payrollRegistry.regk, 2).said == payStub2Bup.said
+            assert rgy.store.headEvent(payrollRegistry.regk).said == payStub2Bup.said
+            assert payStub2Bup.sad["p"] == payStub1Bup.said
+
+            # Build the lender's disclosure-plan request in breadth-first order
+            # from the presentation DAG's origin node. The repeated pay-stub
+            # schema appears twice on purpose: once for `/e/incomePrimary/_/`
+            # and once for `/e/incomeSecondary/_/`.
+            requestedDp = [
+                (presentation.sad['s']['$id'], "/", [
+                    "i",
+                    "a/i",
+                    "a/applicationType",
+                    "a/propertyType",
+                    "a/monthlyHousingPayment",
+                    "a/submitted",
+                ]),
+                (applicant.sad['s']['$id'], "/e/identity/_/", [
+                    "i",
+                    "a/i",
+                    "a/legalName",
+                    "a/address",
+                    "a/phone",
+                ]),
+                (payStub1.sad['s']['$id'], "/e/incomePrimary/_/", [
+                    "i",
+                    "a/i",
+                    "a/employer",
+                    "a/stubId",
+                    "a/periodStart",
+                    "a/periodEnd",
+                    "a/grossPay",
+                    "a/netPay",
+                    "a/currency",
+                    "e/identity/n",
+                    "e/identity/s",
+                ]),
+                (payStub2.sad['s']['$id'], "/e/incomeSecondary/_/", [
+                    "i",
+                    "a/i",
+                    "a/employer",
+                    "a/stubId",
+                    "a/periodStart",
+                    "a/periodEnd",
+                    "a/grossPay",
+                    "a/netPay",
+                    "a/currency",
+                    "e/identity/n",
+                    "e/identity/s",
+                ]),
+                (employment.sad['s']['$id'], "/e/employment/_/", [
+                    "i",
+                    "a/i",
+                    "a/employer",
+                    "a/status",
+                    "a/role",
+                    "a/startDate",
+                    "a/payFrequency",
+                    "a/annualSalary",
+                    "e/identity/n",
+                    "e/identity/s",
+                ]),
+            ]
+
+            recorder = Recorder()
+            exc = Exchanger(hby=hby, handlers=[])
+            loadHandlers(hby=hby, exc=exc, notifier=recorder)
+
+            # Build a real V2 IPEX linear flow. The offer carries only the
+            # disclosure-plan contract; the final grant carries the presentation
+            # as origin, the four blindable state artifacts, the four anchoring
+            # KEL events, and the actual disclosed application data.
+            apply, applyAtc = ipexApply(
+                hab=lenderHab,
+                recp=aliceHab.pre,
+                message="Show two recent pay stubs, employment verification, and the identity subset needed for rental underwriting.",
+                attrs={},
+                dt="2026-08-10T15:00:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                modifiers=dict(dp=requestedDp),
+            )
+            offer, offerAtc = ipexOffer(
+                hab=aliceHab,
+                message="Here is the one-time rental and loan application presentation.",
+                apply=apply,
+                dt="2026-08-10T15:01:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                modifiers=dict(dp=[]),
+            )
+            agree, agreeAtc = ipexAgree(
+                hab=lenderHab,
+                message="I agree to the one-time rental and loan disclosure terms.",
+                offer=offer,
+                dt="2026-08-10T15:02:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+            )
+
+            # The applicant discloses exactly the requested identity subset:
+            # legal name, address, and phone in full, while biometric and DOB
+            # remain compacted as bare SAIDs.
+            identityCompactor = Compactor(mad=dict(applicant.sad['a']), makify=True, kind=kind)
+            identityCompactor.compact()
+            identityCompactor.expand(greedy=True)
+            identityDisclosure = dict(identityCompactor.partials[('',)].mad)
+            for field in ("legalName", "address", "phone"):
+                identityDisclosure[field] = applicant.sad['a'][field]
+
+            # The grant transports every source artifact needed for a verifier
+            # to validate the disclosure end to end:
+            #   * the compact holder-issued presentation as the origin artifact,
+            #   * four blindable issued-state artifacts,
+            #   * four anchoring KEL events, and
+            #   * the mixed disclosure body with identity, both pay stubs, and
+            #     employment verification.
+            # We assume that Alice got the anchors of the four blindable state artifacts either 
+            # from the issuers or from the registries themselves through Observers 
+            grant, grantAtc = ipexGrant(
+                hab=aliceHab,
+                recp=lenderHab.pre,
+                message="Here is the rental and loan application presentation with two pay stubs and employment verification.",
+                origin=presentationCompact,
+                artifacts=[
+                    applicantBup,
+                    payStub1Bup,
+                    payStub2Bup,
+                    employmentBup,
+                    applicantAnc,
+                    payStub1Anc,
+                    payStub2Anc,
+                    employmentAnc,
+                ],
+                agree=agree,
+                dt="2026-08-10T15:03:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+                attrs=dict(
+                    identity=identityDisclosure,
+                    incomePrimary=dict(a=dict(payStub1.sad['a']), e=dict(payStub1.sad['e'])),
+                    incomeSecondary=dict(a=dict(payStub2.sad['a']), e=dict(payStub2.sad['e'])),
+                    employment=dict(a=dict(employment.sad['a']), e=dict(employment.sad['e'])),
+                ),
+            )
+            admit, admitAtc = ipexAdmit(
+                hab=lenderHab,
+                message="Received the rental and loan application presentation and linked issued credentials.",
+                grant=grant,
+                dt="2026-08-10T15:04:00.000000+00:00",
+                kind=kind,
+                gvrsn=Vrsn_2_0,
+            )
+
+            # The apply should preserve the disclosure-plan shape exactly,
+            # including the repeated pay-stub schema entries at two different
+            # DAG paths.
+            assert apply.sad['r'] == "/ipex/apply"
+            assert apply.sad['q']['dp'] == requestedDp
+            assert apply.sad['q']['dp'][2][0] == apply.sad['q']['dp'][3][0] == payStub1.sad['s']['$id']
+            assert apply.sad['q']['dp'][2][1] == "/e/incomePrimary/_/"
+            assert apply.sad['q']['dp'][3][1] == "/e/incomeSecondary/_/"
+
+            # The offer binds the apply and still carries no disclosed
+            # applicant, pay-stub, or employment values.
+            assert offer.sad['p'] == apply.said
+            assert offer.sad['q']['dp'] == []
+            offerWire = bytes(offer.raw) + bytes(offerAtc)
+            assert b"Alice Anders" not in offerWire
+            assert b"220 E 300 S" not in offerWire
+            assert b"WM-2026-07-15" not in offerWire
+            assert b"WM-2026-07-31" not in offerWire
+            assert b"2021-04-12" not in offerWire
+
+            offerIms = bytearray(offer.raw)
+            offerIms.extend(offerAtc)
+            offerResults = Parser(version=Vrsn_2_0).parse(ims=offerIms,
+                                                          framed=False,
+                                                          processive=False)
+            assert offerIms == bytearray()
+            assert len(offerResults) == 1
+            assert offerResults[0].nests == []
+
+            # The final grant should follow the agree and disclose the intended
+            # application fields while carrying all four blindable-state
+            # artifacts and all four anchoring artifacts. The wire body should contain the
+            # disclosed underwriting data but never the blinded state labels.
+            assert grant.sad['r'] == "/ipex/grant"
+            assert grant.sad['p'] == agree.said
+            assert grant.sad['a']['o'] == presentationCompact.said
+            assert 'iss' not in grant.sad['a']
+            assert 'anc' not in grant.sad['a']
+            grantWire = bytes(grant.raw) + bytes(grantAtc)
+            assert b"Alice Anders" in grantWire
+            assert b"220 E 300 S" in grantWire
+            assert b"+1-801-555-0100" in grantWire
+            assert b"WM-2026-07-15" in grantWire
+            assert b"WM-2026-07-31" in grantWire
+            assert b"Operations Supervisor" in grantWire
+            assert b"face-template-sha256:loan-app" not in grantWire
+            assert b"2000-03-15" not in grantWire
+            assert b"issued" not in grantWire
+            assert b"revoked" not in grantWire
+
+            # The parsed grant should preserve the nested artifact order:
+            # presentation first, then every blindable state artifact, then
+            # every anchoring event.
+            grantIms = bytearray(grant.raw)
+            grantIms.extend(grantAtc)
+            grantResults = Parser(version=Vrsn_2_0).parse(ims=grantIms,
+                                                          framed=False,
+                                                          processive=False)
+            assert grantIms == bytearray()
+            assert len(grantResults) == 1
+            grantResult = grantResults[0]
+            assert [nest.serder.said for nest in grantResult.nests] == [
+                presentationCompact.said,
+                applicantBup.said,
+                payStub1Bup.said,
+                payStub2Bup.said,
+                employmentBup.said,
+                applicantAncSerder.said,
+                payStub1AncSerder.said,
+                payStub2AncSerder.said,
+                employmentAncSerder.said,
+            ]
+            assert grantResult.serder.ked["i"] == aliceHab.pre
+            assert grantResult.serder.ked["ri"] == lenderHab.pre
+
+            carriedPresentation = grantResult.nests[0].serder
+            carriedApplicantBup = grantResult.nests[1].serder
+            carriedPayStub1Bup = grantResult.nests[2].serder
+            carriedPayStub2Bup = grantResult.nests[3].serder
+            carriedEmploymentBup = grantResult.nests[4].serder
+            for carriedState in (carriedApplicantBup, carriedPayStub1Bup,
+                                 carriedPayStub2Bup, carriedEmploymentBup):
+                assert b"issued" not in carriedState.raw
+                assert b"revoked" not in carriedState.raw
+
+            # The lender can validate the compact presentation against the
+            # artifact committed for disclosure by the offer/agree path.
+            assert _club_accepts_grant(carriedPresentation.sad, presentation.said,
+                                       presentationSchemaExpanded)
+            assert carriedPresentation.sad["i"] == aliceHab.pre
+            assert isinstance(carriedPresentation.sad["a"], str)
+            assert isinstance(carriedPresentation.sad["e"], str)
+
+            # The disclosed identity subset reveals only the requested fields
+            # and leaves biometric and DOB compacted as bare SAIDs.
+            grantAttrs = grantResult.serder.sad['a']
+            identityDisc = grantAttrs['identity']
+            assert identityDisc['i'] == aliceHab.pre
+            assert isinstance(identityDisc['legalName'], dict)
+            assert isinstance(identityDisc['address'], dict)
+            assert isinstance(identityDisc['phone'], dict)
+            assert isinstance(identityDisc['biometric'], str)
+            assert isinstance(identityDisc['dob'], str)
+            identityCheck = Compactor(mad=dict(identityDisc, d=''),
+                                      makify=True,
+                                      kind=kind)
+            identityCheck.compact()
+            assert identityCheck.said == _committed_a_said(applicant, kind)
+
+            # Both pay-stub disclosures carry the same schema shape and the
+            # same employer, but they must stay distinct source credentials with
+            # distinct stub IDs and distinct DAG paths.
+            incomePrimaryDisc = grantAttrs['incomePrimary']
+            incomeSecondaryDisc = grantAttrs['incomeSecondary']
+            assert incomePrimaryDisc['a']['stubId'] == "WM-2026-07-15"
+            assert incomeSecondaryDisc['a']['stubId'] == "WM-2026-07-31"
+            assert incomePrimaryDisc['a']['employer'] == incomeSecondaryDisc['a']['employer'] == "Wasatch Market"
+            assert incomePrimaryDisc['e']['identity']['o'] == 'E1E'
+            assert incomeSecondaryDisc['e']['identity']['o'] == 'E1E'
+            assert incomePrimaryDisc['e']['identity']['n'] == applicant.said
+            assert incomeSecondaryDisc['e']['identity']['n'] == applicant.said
+
+            # The employment verification remains a separate disclosed artifact
+            # alongside the pay stubs rather than being folded into them.
+            employmentDisc = grantAttrs['employment']
+            assert employmentDisc['a']['employer'] == "Wasatch Market"
+            assert employmentDisc['a']['status'] == "active"
+            assert employmentDisc['a']['role'] == "Operations Supervisor"
+            assert employmentDisc['e']['identity']['o'] == 'E1E'
+            assert employmentDisc['e']['identity']['n'] == applicant.said
+
+            # Production-grade source-credential verification: each transported
+            # blindable update must still be the accepted head of its own source
+            # registry, still anchored in the issuer's KEL, and unblind to the
+            # current `issued` state for the exact disclosed credential.
+            carriedApplicantUnblinder = _assert_current_issued_source_credential(
+                source=applicant,
+                carriedState=carriedApplicantBup,
+                registry=identityRegistry,
+                holder=aliceHab.pre,
+                uuid=applicantBlinder.uuid,
+                states=states,
+            )
+            assert carriedApplicantBup.sad["b"] == applicantBlinder.said
+            assert carriedApplicantUnblinder.crew == applicantBlinder.crew
+
+            carriedPayStub1Unblinder = _assert_current_issued_source_credential(
+                source=payStub1,
+                carriedState=carriedPayStub1Bup,
+                registry=payrollRegistry,
+                holder=aliceHab.pre,
+                uuid=payStub1Blinder.uuid,
+                states=states,
+                require_head=False,
+            )
+            assert carriedPayStub1Bup.sad["b"] == payStub1Blinder.said
+            assert carriedPayStub1Unblinder.crew == payStub1Blinder.crew
+
+            carriedPayStub2Unblinder = _assert_current_issued_source_credential(
+                source=payStub2,
+                carriedState=carriedPayStub2Bup,
+                registry=payrollRegistry,
+                holder=aliceHab.pre,
+                uuid=payStub2Blinder.uuid,
+                states=states,
+            )
+            assert carriedPayStub2Bup.sad["b"] == payStub2Blinder.said
+            assert carriedPayStub2Unblinder.crew == payStub2Blinder.crew
+
+            carriedEmploymentUnblinder = _assert_current_issued_source_credential(
+                source=employment,
+                carriedState=carriedEmploymentBup,
+                registry=employmentRegistry,
+                holder=aliceHab.pre,
+                uuid=employmentBlinder.uuid,
+                states=states,
+            )
+            assert carriedEmploymentBup.sad["b"] == employmentBlinder.said
+            assert carriedEmploymentUnblinder.crew == employmentBlinder.crew
+
+            # Dispatch the full linear flow through the real IPEX handlers and
+            # confirm the accepted exchanges are stored with the exact list
+            # shapes carried by the grant.
+            for exn, atc in ((apply, applyAtc),
+                             (offer, offerAtc),
+                             (agree, agreeAtc),
+                             (grant, grantAtc),
+                             (admit, admitAtc)):
+                ims = bytearray(exn.raw)
+                ims.extend(atc)
+                Parser(version=Vrsn_2_0).parse(ims=ims, framed=False, exc=exc)
+                assert ims == bytearray()
+                assert hby.db.exns.get(keys=(exn.said,)) is not None
+
+            storedGrant = hby.db.exns.get(keys=(grant.said,))
+            assert storedGrant.ked['a']['o'] == presentationCompact.said
+            assert storedGrant.ked['a'] == dict(
+                m="Here is the rental and loan application presentation with two pay stubs and employment verification.",
+                o=presentationCompact.said,
+                identity=identityDisclosure,
+                incomePrimary=dict(a=dict(payStub1.sad['a']), e=dict(payStub1.sad['e'])),
+                incomeSecondary=dict(a=dict(payStub2.sad['a']), e=dict(payStub2.sad['e'])),
+                employment=dict(a=dict(employment.sad['a']), e=dict(employment.sad['e'])),
+            )
+
+            assert [(item["r"], item["m"]) for item in recorder.items] == [
+                ("/exn/ipex/apply",
+                 "Show two recent pay stubs, employment verification, and the identity subset needed for rental underwriting."),
+                ("/exn/ipex/offer",
+                 "Here is the one-time rental and loan application presentation."),
+                ("/exn/ipex/agree",
+                 "I agree to the one-time rental and loan disclosure terms."),
+                ("/exn/ipex/grant",
+                 "Here is the rental and loan application presentation with two pay stubs and employment verification."),
+                ("/exn/ipex/admit",
+                 "Received the rental and loan application presentation and linked issued credentials."),
+            ]
+        finally:
+            rgy.close()
+
+
 if __name__ == "__main__":
     test_source_credentials_and_graduated_disclosure_JSON()
     test_age_identity_edge_E1E_JSON()
@@ -1799,5 +3202,7 @@ if __name__ == "__main__":
     test_gated_ipex_exchange_JSON()
     test_accountability_and_terms_follow_data_JSON()
     test_job_application_entitlement_presentation_JSON()
+    test_job_application_entitlement_presentation_IPEX_blindable_JSON()
+    test_rental_loan_application_two_pay_stubs_IPEX_blindable_JSON()
     for _kind in (Kinds.json, Kinds.cesr, Kinds.cbor, Kinds.mgpk):
         test_clc_serialization_kinds(_kind)
