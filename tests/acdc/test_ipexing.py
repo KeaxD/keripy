@@ -1973,22 +1973,32 @@ def test_ipex_v2_accepts_grant_graph_shape_and_semantics():
                  version=Vrsn_2_0) as hby:
         issuer = hby.makeHab(name="issuer")
         subject = hby.makeHab(name="subject")
+        delegate = hby.makeHab(name="delegate", delpre=issuer.pre)
+        seal = SealEvent(i=delegate.pre, s=delegate.kever.serder.snh,
+                         d=delegate.kever.serder.said)._asdict()
+        issuer.interact(data=[seal], framed=True, version=Vrsn_2_0,
+                        kind=Kinds.json, gvrsn=Vrsn_2_0)
 
         recorder = Recorder()
         exc = Exchanger(hby=hby, handlers=[])
         loadHandlers(hby=hby, exc=exc, notifier=recorder)
         handler = exc.routes["/ipex/grant"]
 
-        def assert_accepted(message, origin, artifacts, prefixes):
+        def assert_accepted(message, origin, artifacts, prefixes, *,
+                            originHab=None, artifactHabs=None):
+            originHab = originHab if originHab is not None else issuer
+            artifactHabs = (artifactHabs if artifactHabs is not None
+                            else [issuer] * len(artifacts))
             plan = [[origin.sad["s"]["$id"], "/", []]]
             plan.extend([artifact.sad["s"]["$id"], prefix, []]
                         for artifact, prefix in zip(artifacts, prefixes, strict=True))
-            exn, atc = ipexGrant(hab=issuer,
+            exn, atc = ipexGrant(hab=originHab,
                                  recp=subject.pre,
                                  message=message,
-                                 origin=_signed(origin, issuer),
-                                 artifacts=[_signed(artifact, issuer)
-                                            for artifact in artifacts],
+                                 origin=_signed(origin, originHab),
+                                 artifacts=[_signed(artifact, hab)
+                                            for artifact, hab in zip(
+                                                artifacts, artifactHabs, strict=True)],
                                  modifiers=dict(dp=[plan]))
             ims = bytearray(exn.raw)
             ims.extend(atc)
@@ -2110,6 +2120,33 @@ def test_ipex_v2_accepts_grant_graph_shape_and_semantics():
                         [listOpChild],
                         ["/e/holder/_/"])
 
+        # I1I suppresses the default I2I relation. The far node is targeted at
+        # subject, not issuer, so the default would fail even though the issuers match.
+        sameIssuerChild = acdcmap(israid=issuer.pre,
+                                  attribute=dict(d="", role="member"),
+                                  iseaid=subject.pre)
+        sameIssuerOrigin = acdcmap(israid=issuer.pre,
+                                   attribute=dict(d="", role="issuer identity"),
+                                   edge=_edge("holder", sameIssuerChild, op="I1I"))
+        assert_accepted("Here is the same-issuer I1I DAG",
+                        sameIssuerOrigin,
+                        [sameIssuerChild],
+                        ["/e/holder/_/"])
+
+        # DI1I admits an anchored delegated descendant and requires no issuee on
+        # either ACDC. Each node is authenticated by its own issuer.
+        delegatedChild = acdcmap(israid=issuer.pre,
+                                 attribute=dict(d="", role="authority"))
+        delegatedOrigin = acdcmap(israid=delegate.pre,
+                                  attribute=dict(d="", role="delegated issuer"),
+                                  edge=_edge("holder", delegatedChild, op="DI1I"))
+        assert_accepted("Here is the delegated-issuer DI1I DAG",
+                        delegatedOrigin,
+                        [delegatedChild],
+                        ["/e/holder/_/"],
+                        originHab=delegate,
+                        artifactHabs=[issuer])
+
         # An untargeted far node takes NI2I as its default, which constrains
         # nothing, so a bare edge to one verifies regardless of the issuer pair.
         untargetedChild = acdcmap(israid=issuer.pre,
@@ -2163,12 +2200,11 @@ def test_ipex_v2_accepts_grant_graph_shape_and_semantics():
         # by issuer to subject, so I2I holds on the far pair and E1E does not.
         # The far node's own verdict is seeded as valid: it carries no issuer-auth
         # proof here, and what is under test is the Operator relation alone.
-        nodes = {listOpChild.said: {"serder": listOpChild}}
-
-        def evaluate(op):
-            edge = dict(d="", n=listOpChild.said, o=op)
-            memo = {listOpChild.said: chaining.valid("far node vetted elsewhere")}
-            return handler._evaluateLeafEdge(edge, nodes=nodes, nserder=listOpOrigin,
+        def evaluate(op, near=listOpOrigin, far=listOpChild):
+            edge = dict(d="", n=far.said, o=op)
+            nodes = {far.said: {"serder": far}}
+            memo = {far.said: chaining.valid("far node vetted elsewhere")}
+            return handler._evaluateLeafEdge(edge, nodes=nodes, nserder=near,
                                              memo=memo, inheritedPins=())
 
         assert evaluate(["NI2I"]).verdict == Verdicts.valid
@@ -2178,6 +2214,17 @@ def test_ipex_v2_accepts_grant_graph_shape_and_semantics():
         assert evaluate(["NI2I", "I2I"]).verdict == Verdicts.valid
         # E1E composes and fails
         assert evaluate(["I2I", "E1E"]).verdict == Verdicts.invalid
+        identityOrigin = acdcmap(israid=delegate.pre,
+                                 attribute=dict(d="", role="delegate"),
+                                 iseaid=issuer.pre)
+        assert evaluate("I1I", near=identityOrigin).verdict == Verdicts.invalid
+        assert evaluate("DI1I", near=identityOrigin).verdict == Verdicts.valid
+        assert evaluate(["DI1I", "I1I"],
+                        near=identityOrigin).verdict == Verdicts.invalid
+        assert evaluate(["I1I", "DI1I"],
+                        near=identityOrigin).verdict == Verdicts.valid
+        assert evaluate(["E1E", "NI2I", "DI1I"],
+                        near=identityOrigin).verdict == Verdicts.valid
         # empty: no constraint, as absent
         assert evaluate([]).verdict == Verdicts.valid
         # A token this verifier cannot evaluate leaves the edge undecided rather
@@ -2211,17 +2258,28 @@ def test_ipex_v2_rejects_invalid_grant_graph_shape_and_semantics():
         incompatSchemer = Schemer(sed=incompatSchema)
         hby.db.schema.pin(incompatSchemer.said, incompatSchemer)
 
-        def assert_rejected(message, origin, artifacts=None):
+        def assert_rejected(message, origin, artifacts=None, *, originHab=None,
+                            artifactHabs=None, prefixes=None, escrow=False):
             before = len(recorder.items)
             plan = [[origin.sad["s"]["$id"], "/", []]]
             for idx, artifact in enumerate(artifacts or []):
+                prefix = (prefixes[idx] if prefixes is not None
+                          else f"/e/rejected{idx}/_/")
                 plan.append([artifact.sad["s"]["$id"],
-                             f"/e/rejected{idx}/_/", []])
-            exn, atc = ipexGrant(hab=issuer,
+                             prefix, []])
+            originStream = (_signed(origin, originHab)
+                            if originHab is not None else origin)
+            artifactStreams = artifacts
+            if artifactHabs is not None:
+                artifactStreams = [_signed(artifact, hab)
+                                   for artifact, hab in zip(
+                                       artifacts or [], artifactHabs, strict=True)]
+            grantor = originHab if originHab is not None else issuer
+            exn, atc = ipexGrant(hab=grantor,
                                  recp=subject.pre,
                                  message=message,
-                                 origin=origin,
-                                 artifacts=artifacts,
+                                 origin=originStream,
+                                 artifacts=artifactStreams,
                                  modifiers=dict(dp=[plan]))
             ims = bytearray(exn.raw)
             ims.extend(atc)
@@ -2229,6 +2287,10 @@ def test_ipex_v2_rejects_invalid_grant_graph_shape_and_semantics():
             assert ims == bytearray()
             assert hby.db.exns.get(keys=(exn.said,)) is None
             assert len(recorder.items) == before
+            if escrow:
+                assert hby.db.epse.get(keys=(exn.said,)) is not None
+            else:
+                assert hby.db.epse.get(keys=(exn.said,)) is None
 
         # Missing referenced node: the walk is not closed.
         missingChild = acdcmap(israid=issuer.pre,
@@ -2326,7 +2388,7 @@ def test_ipex_v2_rejects_invalid_grant_graph_shape_and_semantics():
         diChild = acdcmap(israid=issuer.pre,
                           attribute=dict(d="", role="member"),
                           iseaid=issuer.pre)
-        diOrigin = acdcmap(israid=issuer.pre,
+        diOrigin = acdcmap(israid=subject.pre,
                            attribute=dict(d="", LEI="254900OPPU84GM83MG36"),
                            edge=_edge("holder", diChild, op="DI2I"),
                            iseaid=subject.pre)
@@ -2339,8 +2401,37 @@ def test_ipex_v2_rejects_invalid_grant_graph_shape_and_semantics():
             nserder=diOrigin,
             memo={diChild.said: chaining.valid("far node vetted elsewhere")},
             inheritedPins=())
-        assert diVerdict.verdict == Verdicts.unknown
+        assert diVerdict.verdict == Verdicts.invalid
         assert diVerdict.retryable is False
+
+        # A complete issuer ancestry ending at another root is a permanent DI1I
+        # refusal, while a claimed direct delegation with no anchor is retryable.
+        unrelated = hby.makeHab(name="unrelated")
+        unapproved = hby.makeHab(name="unapproved", delpre=issuer.pre)
+        issuerChild = acdcmap(israid=issuer.pre,
+                              attribute=dict(d="", role="authority"))
+        unrelatedOrigin = acdcmap(
+            israid=unrelated.pre,
+            attribute=dict(d="", role="unrelated issuer"),
+            edge=_edge("holder", issuerChild, op="DI1I"))
+        assert_rejected("Here is the unrelated-issuer DI1I DAG",
+                        unrelatedOrigin,
+                        [issuerChild],
+                        originHab=unrelated,
+                        artifactHabs=[issuer],
+                        prefixes=["/e/holder/_/"])
+
+        unapprovedOrigin = acdcmap(
+            israid=unapproved.pre,
+            attribute=dict(d="", role="unapproved delegate"),
+            edge=_edge("holder", issuerChild, op="DI1I"))
+        assert_rejected("Here is the DI1I DAG awaiting a delegation anchor",
+                        unapprovedOrigin,
+                        [issuerChild],
+                        originHab=unapproved,
+                        artifactHabs=[issuer],
+                        prefixes=["/e/holder/_/"],
+                        escrow=True)
 
         # A list containing any unknown operator is malformed.
         listOpChild = acdcmap(israid=issuer.pre,
@@ -7811,11 +7902,11 @@ def test_ipex_v2_reduces_far_node_status_inside_the_edge_operator():
             assert list(recipientHby.db.exrs.getTopItemIter(keys=(exn.said, ""))) == []
 
             # An Operator this verifier cannot evaluate is an unknown in the lattice,
-            # so a satisfied sibling decides the group without it. DI2I is recognized
+            # so a satisfied sibling decides the group without it. NOT is recognized
             # and unimplemented; BOGUS is not recognized at all; neither can change a
             # verdict its siblings already decide.
             accepted(dict(d="", either=group("OR", a=leaf(good),
-                                             b=leaf(spare, op="DI2I"))),
+                                             b=leaf(spare, op="NOT"))),
                      [goodNest, _proofed(spare, spareBlinder)],
                      "OR over an unimplemented unary Operator")
             accepted(dict(d="", either=group("OR", a=leaf(good),

@@ -58,12 +58,14 @@ class Verifier:
 
     # Unary edge operators this verifier recognizes. A token outside this set cannot be
     # evaluated, so an edge carrying one is refused rather than validated under a
-    # substituted operator -- see .verifyChain. DI2I and NOT are recognized but
-    # unimplemented, and refused for the same reason.
+    # substituted operator -- see .verifyChain. NOT is recognized but unimplemented,
+    # and refused for the same reason.
     # E1E is normative on the spec's v1.1 branch (kswg-acdc-specification#197). It is
     # absent from the 1.0 text currently under ToIP ratification, so a validator built
     # against 1.0 alone will not recognize it.
-    UnaryOps = ('I2I', 'NI2I', 'DI2I', 'E1E', 'NOT')
+    # I1I and DI1I are the concrete issuer-identity operators proposed in discussion
+    # #1515 and remain gated on their companion specification change.
+    UnaryOps = ('I2I', 'NI2I', 'DI2I', 'E1E', 'I1I', 'DI1I', 'NOT')
 
     # The delegative subset of .UnaryOps: each constrains the near ACDC's issuer
     # relative to the far node's issuee, so they are mutually exclusive and a list
@@ -71,11 +73,15 @@ class Verifier:
     # subset constrain something else and compose with the winner instead.
     DelegativeOps = ('I2I', 'NI2I', 'DI2I')
 
+    # These operators independently constrain the near issuer relative to the far
+    # issuer. They conflict with each other, but compose with E1E and DelegativeOps.
+    IssuerIdentityOps = ('I1I', 'DI1I')
+
     # Unary operators whose presence suppresses the default rule, per the spec's
     # three-part condition -- see .verifyChain. E1E is in the set because it
     # constrains the near issuee, which is a relation the default would otherwise
     # add a second, conflicting one alongside.
-    DefaultSuppressingOps = ('I2I', 'NI2I', 'DI2I', 'E1E')
+    DefaultSuppressingOps = ('I2I', 'NI2I', 'DI2I', 'E1E', 'I1I', 'DI1I')
 
     # M-ary (aggregating) Operators from the ACDC spec's normative Edge-group table
     # (spec-body.md, "##### Operator, `o` field" under "#### Edge-group"). These
@@ -846,12 +852,14 @@ class Verifier:
         # constrains the near issuee instead, so it does not conflict with them and
         # composes (AND) rather than overriding or being overridden.
         op = next((cand for cand in reversed(ops) if cand in self.DelegativeOps), None)
+        iop = next((cand for cand in reversed(ops) if cand in self.IssuerIdentityOps),
+                   None)
 
         # "When the Operator, `o`, field is missing or empty or is present but does
-        # not include any of the I2I, NI2I, DI2I or E1E Operators" the default is
-        # appended (spec-body.md). Keyed on that set rather than on the list being
-        # empty, matching acdc.ipexing.DefaultSuppressingEdgeOps, so an `o` carrying
-        # only a non-delegative Operator still takes the default the spec appends.
+        # not include any Operator that constrains issuer or issuee identity" the
+        # default is appended. Keyed on that set rather than on the list being empty,
+        # matching acdc.ipexing.DefaultSuppressingEdgeOps. I1I and DI1I suppress the
+        # default so they do not silently gain an issuee-oriented constraint.
         # No behaviour differs today -- the only recognized non-suppressing token is
         # NOT, which is refused above -- but the two paths encoded the rule
         # differently, and the divergence would surface the moment NOT is evaluable.
@@ -886,6 +894,20 @@ class Verifier:
                                        f"issuees; near issuee {issuee} != far issuee "
                                        f"{farIssuee}")
 
+        if iop is not None and issuer != creder.israid:
+            if iop == 'I1I':
+                raise EdgeRefusalError(f"I1I edge to node {nodeSaid} requires equal "
+                                       f"issuers; near issuer {issuer} != far issuer "
+                                       f"{creder.israid}")
+
+            delegated = self.hby.kvy.isDelegated(issuer, creder.israid)
+            if delegated is None:
+                return None
+            if not delegated:
+                raise EdgeRefusalError(f"DI1I edge to node {nodeSaid} requires the "
+                                       f"near issuer {issuer} to be the far issuer "
+                                       f"{creder.israid} or its delegated descendant")
+
         if op == 'DI2I':
             # Delegated-issuer relation (ACDC spec-body.md L1194): the near ACDC's issuer
             # MUST be "either the Issuee AID or a delegated AID" of the far node's issuee.
@@ -907,10 +929,17 @@ class Verifier:
             # on the local store rather than on the delegation.
             farIssuee = creder.iseaid
             if farIssuee is None:  # untargeted far node: no issuee to be a delegate of
-                return None
+                raise EdgeRefusalError(f"DI2I edge to node {nodeSaid} requires a "
+                                       f"targeted far node, which has no issuee")
 
-            if issuer != farIssuee and not self._isDelegatedAID(issuer, farIssuee):
-                return None
+            if issuer != farIssuee:
+                delegated = self.hby.kvy.isDelegated(issuer, farIssuee)
+                if delegated is None:
+                    return None
+                if not delegated:
+                    raise EdgeRefusalError(f"DI2I edge to node {nodeSaid} requires the "
+                                           f"near issuer {issuer} to be the far issuee "
+                                           f"{farIssuee} or its delegated descendant")
 
         elif op is not None and op != 'NI2I':
             # Resolve the far node's issuee via .iseaid so an aggregate ('acg') far
@@ -945,138 +974,3 @@ class Verifier:
             return None
 
         return state
-
-    def _isDelegatedAID(self, pre, delpre):
-        """Returns True if pre is a delegated AID of delpre, at any depth.
-
-        Climbs pre's delegation chain toward delpre and requires of every hop that the
-        delegator anchored the delegate's `dip` and was itself permitted to delegate.
-        Both are per-hop questions, so neither can be asked once at the top.
-
-        Deliberately NOT implemented as ``kevers[pre].delpre == delpre``.
-        ``Kevery.validateDelegation`` returns early -- with no seal lookup whatsoever --
-        when the delegated event is locally owned, locally membered, or locally witnessed
-        (core/eventing.py:3269-3271), and the comment there is explicit that a witness
-        "accepts without waiting for delegation seal to be anchored in delegator's KEL".
-        Since setupWitness co-locates a credential Verifier in the same Habery, a
-        delpre-based check would accept a DI2I edge for any AID this Habery happens to
-        witness whose claimed delegator never anchored anything: issuance under authority
-        never granted. ``delpre`` records what the delegate asserted in its own `di` field;
-        only the delegator's anchored approval seal records what the delegator agreed to.
-
-        So each hop is confirmed the way the KEL layer confirms it, by delegating to
-        Kever.fetchDelegatingEvent: consult the approval source-seal couple in .db.aess --
-        which logEvent writes only when validateDelegation actually found and verified the
-        seal, since the exemption returns (None, None) and that write is gated on those
-        being present -- and failing that, walk the delegator's KEL for the anchoring seal
-        directly. That KEL walk is what keeps a Habery with no .aess entry (a witness, or
-        the delegate's own controller) from being permanently unable to validate an edge
-        that is in fact approved. .aess is also pinned by flows in which this Habery
-        took part in the delegation itself (app/delegating.py:153, app/grouping.py:220,
-        cli/commands/delegate/confirm.py:109), each only after observing the anchor.
-
-        DND is re-checked here for the same reason delpre is not trusted: the exemption
-        above returns before validateDelegation reaches its doNotDelegate refusal at
-        core/eventing.py:3287, so an exempted Habery holds dips a disinterested validator
-        would never have accepted. Without this, a witness-hosted Verifier would honor a
-        chain that a watcher-fed one refuses -- identical bytes, opposite verdicts, which
-        is precisely what reading the anchor instead of `delpre` exists to prevent. The
-        trait is read from the delegator's inception event and Kever.config runs once, so a
-        delegator's answer here never moves.
-
-        The climb needs no depth bound and gets none: a delegated AID's prefix is a digest
-        of the `dip` that carries its `di`, so a cycle in the chain would require a hash
-        cycle. A bound would also be a conformance seam, letting two conforming validators
-        disagree on identical bytes with no wire-visible cause. Depth is the delegator's to
-        choose, via DND. The visited set below is a termination guarantee over a possibly
-        corrupt local database, not a policy.
-
-        Called with original=False so that a missing seal returns None rather than raising,
-        and so an inconsistent .aess entry is left alone: a verifier reads key state, it
-        does not repair the delegate's escrow. The one write this can cause is
-        fetchDelegatingEvent pinning the couple it has just verified against the
-        delegator's trunk -- the same cache repair keripy performs during escrow
-        processing, gated on the delegated event already having been accepted. A
-        ValidationError from a genuinely inconsistent database is left to propagate rather
-        than being flattened into a silent False.
-
-        Superseding is handled as the KEL layer handles it, not more strictly. The .aess
-        fast path accepts a delegating event that was first seen (it checks .fons) even if
-        it has since been superseded -- fetchDelegatingEvent documents that as deliberate --
-        while the KEL walk looks only at the last event at each sn and so would not find
-        one. Inheriting that asymmetry is the right call rather than something to tighten
-        here: a validator that has accepted the delegate's KEL should not then refuse the
-        credentials that delegate issued, and DI2I asks the same question the KEL layer
-        already answered.
-
-        That asymmetry has a consequence worth stating plainly, because it sits in tension
-        with the DND paragraph above. A validator that evaluated an edge before an
-        intermediate's anchoring event was superseded keeps a pinned .aess entry and goes
-        on accepting; one that first evaluates it afterwards walks the KEL, does not find
-        the superseded anchor, and refuses. Same bytes, verdicts that differ by when the
-        validator first looked. It is not introduced here -- it is fetchDelegatingEvent's
-        documented first-seen behavior, and it is identical at one hop -- but this is the
-        first caller to reach it from the credential layer, so it is no longer only the KEL
-        layer's to own. Answering it belongs with superseding recovery, not with an edge
-        operator second-guessing the KEL its own validator accepted.
-
-        Retirement of a delegate is deliberately not modelled. It is key-state based: a
-        retired delegate rotates to keys it cannot sign with, so it issues nothing further
-        while everything it issued while authorized stays valid, and the approval seals are
-        byte-identical before and after. A check here that tried to detect retirement would
-        both fail (nothing changes structurally) and be wrong (it would invalidate
-        credentials issued while the delegate was legitimately authorized).
-
-        Parameters:
-            pre (str): qb64 AID whose delegation is in question, i.e. the issuer of the
-                near (edge-bearing) ACDC
-            delpre (str): qb64 AID that must be somewhere above it in the delegation
-                chain, i.e. the far node's issuee
-
-        Returns:
-            bool: True means every hop from pre up to delpre is a delegation its delegator
-                anchored and that DND permitted.
-
-        """
-        seen = set()
-        while pre not in seen:
-            seen.add(pre)
-
-            if pre not in self.hby.kevers:  # no key state, nothing to evaluate
-                return False
-
-            kever = self.hby.kevers[pre]
-            if kever.delpre is None:  # top of the chain reached without meeting delpre
-                return False
-
-            if kever.delpre not in self.hby.kevers:  # delegator's KEL unknown
-                return False
-
-            if self.hby.kevers[kever.delpre].doNotDelegate:
-                return False
-
-            # The delegation is settled at inception and does not move afterwards. `di`
-            # appears in a `dip` and in no other event -- a `drt` has no such field -- so
-            # the delegator anchoring the `dip` is the whole of what makes this hop a
-            # delegation, and no later event can change or renew it. An earlier revision
-            # keyed on `kever.lastEst.d`, asking whether the delegate's *current*
-            # establishment event was approved; that is the KEL layer's question, and
-            # asking it again here made a fixed edge unstable inside the exemption above,
-            # where an unanchored rotation is accepted locally and `lastEst` advances.
-            #
-            # A delegated AID's prefix is a digest of its own `dip`, so `i` equals `d`
-            # there and the `dip` is retrievable at (pre, pre).
-            serder = self.hby.db.evts.get(keys=(pre, pre))
-            if serder is None:  # delegated inception event not retrievable
-                return False
-
-            if kever.fetchDelegatingEvent(delpre=kever.delpre, serder=serder,
-                                          original=False, eager=True) is None:
-                return False
-
-            if kever.delpre == delpre:
-                return True
-
-            pre = kever.delpre
-
-        return False  # cycle, reachable only from a corrupt database

@@ -447,7 +447,7 @@ def _buildSediCredentials(
         tuple(residenceAttributePaths)
     ].mad
 
-    # Create a nested edge that references the holder's Core SEDI
+    # Bind the residence to the same subject and issuer as the holder's Core SEDI.
     residenceEdgeMad = dict(
         d="",
         u=nonces[24],
@@ -457,7 +457,7 @@ def _buildSediCredentials(
             n=core.said,
             s=CoreSchemaSaid,
             o=(
-                ["E1E", "NI2I"]
+                ["E1E", "I1I"]
                 if residenceOperators is None
                 else residenceOperators
             ),

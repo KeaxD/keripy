@@ -47,17 +47,16 @@ DisclosedNodeIlks = (None, Ilks.acm, Ilks.ace, Ilks.act, Ilks.acg)
 EdgeSectionLabels = ("d", "u", "s", "o", "w")
 EdgeGroupLabels = ("d", "u", "s", "o", "w")
 EdgeNodeLabels = ("d", "u", "n", "s", "o", "w")
-UnaryEdgeOps = ("I2I", "NI2I", "DI2I", "E1E", "NOT")
+# I1I and DI1I are discussion #1515's concrete proposal; merging their runtime
+# support remains gated on the companion specification wording.
+UnaryEdgeOps = ("I2I", "NI2I", "DI2I", "E1E", "I1I", "DI1I", "NOT")
 DelegativeEdgeOps = ("I2I", "NI2I", "DI2I")
+IssuerIdentityEdgeOps = ("I1I", "DI1I")
 
-# Unary operators whose presence suppresses the default rule. "When the Operator, `o`,
-# field is missing or empty or is present but does not include any of the `I2I`, `NI2I`,
-# `DI2I`, or `E1E` Operators" then the default is appended (ACDC spec, Edge Section >
-# Edge > Operator, `o` field, on the ACDC v1.1 line, which added E1E to the list; the
-# 2.0 line still names only the delegative three because E1E has not been forward-ported
-# there). Keyed on this set rather than on the list being empty, so an `o` carrying only
-# a non-delegative operator still takes the default the spec appends.
-DefaultSuppressingEdgeOps = ("I2I", "NI2I", "DI2I", "E1E")
+# Unary operators whose presence suppresses the default rule. The existing rule names
+# I2I, NI2I, DI2I and E1E; discussion #1515's proposed issuer-identity group extends
+# that list with I1I and DI1I so neither silently acquires an issuee-oriented constraint.
+DefaultSuppressingEdgeOps = ("I2I", "NI2I", "DI2I", "E1E", "I1I", "DI1I")
 EdgeGroupOps = ("AND", "OR")
 
 def _streamSerder(stream):
@@ -1335,10 +1334,12 @@ class IpexHandler:
         # Latest-wins applies only "among the conflicting Operators" (ACDC spec, Edge
         # Section > Edge > Operator, `o` field). The delegative operators constrain the
         # same thing -- the near ACDC's issuer relative to the far node's issuee -- so
-        # they conflict and the latest of them wins. E1E constrains the near issuee
-        # instead, so it composes with the winner rather than overriding it or being
-        # overridden.
+        # they conflict and the latest of them wins. I1I and DI1I form a separate
+        # conflict group over the near and far issuers. E1E constrains the issuees, so
+        # all three groups compose rather than overriding one another.
         dop = next((cand for cand in reversed(ops) if cand in DelegativeEdgeOps), None)
+        iop = next((cand for cand in reversed(ops)
+                    if cand in IssuerIdentityEdgeOps), None)
 
         # Recognized but unevaluated leaf operators leave the edge undecided, for the
         # same reason an unrecognized token does: the relation may well hold, and
@@ -1346,8 +1347,6 @@ class IpexHandler:
         # claim than the evidence supports, and under OR it is the difference between
         # a sibling carrying the group and the whole section failing.
         unevaluable = [cand for cand in ops if cand == "NOT"]
-        if dop == "DI2I":
-            unevaluable = unevaluable + [dop]
         if unevaluable:
             return withFarNode(chaining.unknown(
                 f"unimplemented unary Operator(s) {unevaluable} on edge to node "
@@ -1356,6 +1355,7 @@ class IpexHandler:
         # Start from a passing state, then knock the edge down to False if
         # any required relation check fails.
         matched = True
+        pending = None
         reason = f"edge to node {edgeSaid} satisfies its Operator and schema pins"
         if "E1E" in ops:
             if (not nserder.iseaid
@@ -1364,6 +1364,23 @@ class IpexHandler:
                 matched = False
                 reason = (f"E1E edge to node {edgeSaid} requires equal issuees; near "
                           f"issuee {nserder.iseaid} != far issuee {fserder.iseaid}")
+
+        if matched and iop == "I1I" and nserder.israid != fserder.israid:
+            matched = False
+            reason = (f"I1I edge to node {edgeSaid} requires equal issuers; near "
+                      f"issuer {nserder.israid} != far issuer {fserder.israid}")
+
+        if matched and iop == "DI1I" and nserder.israid != fserder.israid:
+            delegated = self.hby.kvy.isDelegated(nserder.israid, fserder.israid)
+            if delegated is None:
+                pending = (f"DI1I edge to node {edgeSaid} is missing delegation "
+                           f"evidence from near issuer {nserder.israid} to far issuer "
+                           f"{fserder.israid}")
+            elif not delegated:
+                matched = False
+                reason = (f"DI1I edge to node {edgeSaid} requires the near issuer "
+                          f"{nserder.israid} to be the far issuer {fserder.israid} "
+                          f"or its delegated descendant")
 
         # I2I compares the near issuer to the far Issuee. NI2I is explicitly
         # non-delegative and therefore adds no issuer-to-Issuee equality.
@@ -1377,6 +1394,25 @@ class IpexHandler:
                 reason = (f"I2I edge to node {edgeSaid} requires the near issuer to "
                           f"be the far issuee; issuer {nserder.israid} != far issuee "
                           f"{fserder.iseaid}")
+
+        if matched and dop == "DI2I":
+            if not fserder.iseaid:
+                matched = False
+                reason = (f"DI2I edge to node {edgeSaid} requires a targeted far "
+                          f"node, which has no issuee")
+            elif nserder.israid != fserder.iseaid:
+                delegated = self.hby.kvy.isDelegated(nserder.israid,
+                                                      fserder.iseaid)
+                if delegated is None:
+                    if pending is None:
+                        pending = (f"DI2I edge to node {edgeSaid} is missing delegation "
+                                   f"evidence from near issuer {nserder.israid} to far "
+                                   f"issuee {fserder.iseaid}")
+                elif not delegated:
+                    matched = False
+                    reason = (f"DI2I edge to node {edgeSaid} requires the near issuer "
+                              f"{nserder.israid} to be the far issuee "
+                              f"{fserder.iseaid} or its delegated descendant")
 
         own = None  # set when a pin is neither satisfied nor refused, only unread
         for edgeSchemaId, edgeSchemer in resolved:
@@ -1424,7 +1460,12 @@ class IpexHandler:
                           f"{edgeSchemaId}: {ex}")
 
         if own is None:
-            own = chaining.valid(reason) if matched else chaining.invalid(reason)
+            if not matched:
+                own = chaining.invalid(reason)
+            elif pending is not None:
+                own = chaining.unknown(pending, retryable=True)
+            else:
+                own = chaining.valid(reason)
 
         # The far node's own verdict is the other half of what decides this edge: an
         # Operator relation that holds against a far node whose issuer-auth is

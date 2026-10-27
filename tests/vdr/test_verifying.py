@@ -1287,7 +1287,7 @@ def test_verifier_list_valued_operator(seeder):
         assert verfer.reger.saved.get(keys=near.saidb) is None
 
         # NOT is normative (the unary Operator table: the far node's validity is
-        # inverted) and unimplemented here. It must fail closed like DI2I rather than
+        # inverted) and unimplemented here. It must fail closed rather than
         # being skipped as an unrecognized token -- otherwise an edge asserting "this
         # node must be INVALID" would be accepted as valid.
         chainSad = dict(d='', node=dict(n=far.said, o=["NOT"]))
@@ -1910,8 +1910,8 @@ def test_verifier_di2i_delegated_issuer_edge(seeder):
 
         # The remaining rows vary only the near ACDC's issuer, which is the single input
         # DI2I constrains, so they call .verifyChain directly instead of minting a
-        # credential and a registry apiece. A None state is exactly what processCredential
-        # turns into "escrow, do not save" -- cases 4 and 5 above pin that wiring.
+        # credential and a registry apiece. Missing evidence returns None for retry;
+        # a complete mismatch raises EdgeRefusalError and is not escrowed.
         assert verfer.verifyChain(far.said, "DI2I", issuer=sub.pre) is not None
         assert verfer.verifyChain(far.said, "DI2I", issuer=qvi.pre) is not None
         assert verfer.verifyChain(far.said, "DI2I", issuer=grand.pre) is not None
@@ -1921,12 +1921,14 @@ def test_verifier_di2i_delegated_issuer_edge(seeder):
         assert verfer.verifyChain(far.said, "DI2I", issuer=great.pre) is not None
 
         # 7 -- not delegated at all: delpre is None.
-        assert verfer.verifyChain(far.said, "DI2I", issuer=gar.pre) is None
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, "DI2I", issuer=gar.pre)
 
         # 8 -- delegated, but by someone other than the far issuee. An implementation that
         # checked the truthy `Kever.delegated` flag, or merely that .aess had an entry,
         # would accept this one. The climb ends at gar, which has no delegator.
-        assert verfer.verifyChain(far.said, "DI2I", issuer=rogue.pre) is None
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, "DI2I", issuer=rogue.pre)
 
         # 9 -- the near issuer's KEL is absent from .kevers. Must return None rather than
         # raise KeyError, which would escape _processEscrow's typed arm and abort the pass.
@@ -1952,10 +1954,40 @@ def test_verifier_di2i_delegated_issuer_edge(seeder):
         assert verfer.verifyChain(far.said, "DI2I", issuer=leaf.pre) is None
 
         # 13 -- and DND likewise is asked of every hop's delegator, not just the first.
-        assert verfer.verifyChain(far.said, "DI2I", issuer=further.pre) is None
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, "DI2I", issuer=further.pre)
 
         # bounded itself is unaffected: DND bounds what it may delegate, not what it may do.
         assert verfer.verifyChain(far.said, "DI2I", issuer=bounded.pre) is not None
+
+        # I1I and DI1I compare issuers independently of the issuee-oriented group and
+        # suppress its default. Neither needs the near or far ACDC to have an issuee.
+        assert verfer.verifyChain(far.said, "I1I", issuer=gar.pre) is not None
+        assert verfer.verifyChain(far.said, "DI1I", issuer=gar.pre) is not None
+        assert verfer.verifyChain(far.said, "DI1I", issuer=rogue.pre) is not None
+
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, "I1I", issuer=rogue.pre)
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, "DI1I", issuer=qvi.pre)
+
+        # Missing issuer KEL evidence is retryable, not a permanent refusal.
+        assert verfer.verifyChain(far.said, "DI1I", issuer=stranger.pre) is None
+
+        # Latest wins only inside the I1I/DI1I conflict group.
+        with pytest.raises(EdgeRefusalError):
+            verfer.verifyChain(far.said, ["DI1I", "I1I"], issuer=rogue.pre)
+        assert verfer.verifyChain(far.said, ["I1I", "DI1I"],
+                                  issuer=rogue.pre) is not None
+
+        # The issuer-identity group composes with E1E and NI2I. It also suppresses
+        # the implicit I2I default: gar is the far issuer but not the far issuee.
+        assert verfer.verifyChain(far.said, ["E1E", "NI2I", "DI1I"],
+                                  issuer=rogue.pre, issuee=qvi.pre) is not None
+        assert verfer.verifyChain(farUntargeted.said, "I1I",
+                                  issuer=gar.pre) is not None
+        assert verfer.verifyChain(farUntargeted.said, "DI1I",
+                                  issuer=gar.pre) is not None
 
     """End Test"""
 
@@ -2042,7 +2074,7 @@ def test_verifier_di2i_requires_anchored_delegation(seeder):
         # on hostile input rather than a refusal -- and KeyError is not a type
         # processCredential's callers handle.
         assert qvi.pre not in witHby.kevers
-        assert witverfer._isDelegatedAID(sub.pre, qvi.pre) is False
+        assert witHby.kvy.isDelegated(sub.pre, qvi.pre) is None
 
         # Give the witness everything except qvi's approval: qvi's KEL up to but not
         # including it, qvi's registry TEL, and the far node's TEL.
@@ -2110,7 +2142,7 @@ def test_verifier_di2i_survives_an_unapproved_delegated_rotation(seeder):
     near issuer a delegated AID of the far node's issuee -- is settled once, by the
     delegator anchoring the `dip`, and no later event can change or renew it.
 
-    An earlier version of ._isDelegatedAID keyed on ``kever.lastEst.d`` instead,
+    An earlier version of ``Kevery.isDelegated`` keyed on ``kever.lastEst.d`` instead,
     which asked a different question: is the delegate's *current* establishment event
     approved. That is a real question, but it belongs to the KEL layer, which already
     refuses an unanchored `drt` for every validator that is not exempted by the
@@ -2189,8 +2221,8 @@ def test_verifier_di2i_climbs_v2_and_native_cesr_kels(seeder):
     Unit level on purpose. v2 registry management is stubbed (``keri/acdc/registering.py``
     and siblings), and ``Regery.makeRegistry`` is v1-only -- ``vcp`` is a v1 ilk -- so a v2
     far node cannot be issued and .verifyChain cannot be reached end to end at v2 yet.
-    Nothing in the climb touches a registry, so exercising ._isDelegatedAID directly loses
-    no coverage of what this branch changes.
+    Nothing in the climb touches a registry, so exercising ``Kevery.isDelegated``
+    directly loses no coverage of what this branch changes.
     """
     for kind in (Kinds.json, Kinds.cesr):
         with openHby(name="v2di2i", salt=DI2I_SALT, temp=True, version=Vrsn_2_0) as hby:
@@ -2216,13 +2248,12 @@ def test_verifier_di2i_climbs_v2_and_native_cesr_kels(seeder):
             assert dip.pvrsn == Vrsn_2_0
             assert dip.kind == kind
 
-            verfer = Verifier(hby=hby, reger=Regery(hby=hby, name="v2di2i", temp=True).reger)
-            assert verfer._isDelegatedAID(sub.pre, qvi.pre) is True
-            assert verfer._isDelegatedAID(grand.pre, qvi.pre) is True    # depth
-            assert verfer._isDelegatedAID(bounded.pre, qvi.pre) is True  # DND binds below
-            assert verfer._isDelegatedAID(beyond.pre, qvi.pre) is False  # ... and only below
-            assert verfer._isDelegatedAID(unapproved.pre, qvi.pre) is False
-            assert verfer._isDelegatedAID(qvi.pre, qvi.pre) is False     # no self-loop
+            assert hby.kvy.isDelegated(sub.pre, qvi.pre) is True
+            assert hby.kvy.isDelegated(grand.pre, qvi.pre) is True    # depth
+            assert hby.kvy.isDelegated(bounded.pre, qvi.pre) is True  # DND binds below
+            assert hby.kvy.isDelegated(beyond.pre, qvi.pre) is False  # ... and only below
+            assert hby.kvy.isDelegated(unapproved.pre, qvi.pre) is None
+            assert hby.kvy.isDelegated(qvi.pre, qvi.pre) is False     # no self-loop
 
     """End Test"""
 
@@ -2400,7 +2431,7 @@ def test_verifier_permanent_edge_refusal_does_not_escrow(seeder):
 
         # An operator this verifier cannot evaluate is refused too, but as its own
         # kind: the edge may well hold, and only the verifier's reach is at fault.
-        unsupported = issued(dict(claim="delegated"), source=edge(core.said, "DI2I"))
+        unsupported = issued(dict(claim="negated"), source=edge(core.said, "NOT"))
         refusalIsClean(unsupported, UnsupportedOperatorError)
         assert issubclass(UnsupportedOperatorError, ValidationError)
         assert not issubclass(UnsupportedOperatorError, EdgeRefusalError)
@@ -2624,19 +2655,19 @@ def test_verifier_reduces_the_edge_section_before_disposing(seeder):
               "OR over a revoked member")
 
         # Retryability propagates with the verdict, so the disposition reads one bit
-        # instead of re-examining the members. DI2I is recognized and unimplemented:
+        # instead of re-examining the members. NOT is recognized and unimplemented:
         # an unknown no arrival can settle. Under OR one retryable unknown can still
         # carry the group on its own, so the ACDC escrows and queries for it.
         escrows(dict(d='', either=saidify(dict(d='', o="OR",
                                                pending=ok(absentSaid),
-                                               delegated=dict(n=work.said, o="DI2I")))),
+                                               negated=dict(n=work.said, o="NOT")))),
                 "OR whose only hope is the retryable member", [absentSaid])
 
         # Under AND one non-retryable unknown makes valid unreachable however much
         # arrives, so escrowing would promise a retry that cannot succeed.
         refuses(dict(d='', both=saidify(dict(d='', o="AND",
                                              pending=ok(absentSaid),
-                                             delegated=dict(n=work.said, o="DI2I")))),
+                                             negated=dict(n=work.said, o="NOT")))),
                 "AND held by a member no arrival can settle", UnsupportedOperatorError)
 
         # An Operator this verifier cannot evaluate is an unknown in the lattice, so
@@ -2646,8 +2677,8 @@ def test_verifier_reduces_the_edge_section_before_disposing(seeder):
         # outcome-relevant reduces to unknown, which refuses.
         saves(dict(d='', either=saidify(dict(d='', o="OR",
                                              work=ok(work.said),
-                                             delegated=dict(n=citizenship.said,
-                                                            o="DI2I")))),
+                                             negated=dict(n=citizenship.said,
+                                                          o="NOT")))),
               "OR over an unevaluable unary operator")
 
         # The same for an m-ary Operator this verifier does not reduce. NOR is in the
@@ -2885,9 +2916,9 @@ def test_verifier_unknown_edge_operator_fails_closed():
     one, and anything future (a time bound, an issuer-set restriction) is the same
     shape. Silently dropping the token therefore relaxes the Issuer's stated rule, in
     the direction of accepting more, with nothing on the wire or in the log to say a
-    divergence happened. The ACDC unary table (ACDC spec, Edge Section > Edge >
-    Operator, `o` field) defines four operators and says nothing about a fifth, so this
-    is keripy choosing to fail closed where the spec is silent.
+    divergence happened. The ACDC unary table defines a finite recognized set and says
+    nothing about other tokens, so this is keripy choosing to fail closed where the
+    spec is silent.
 
     The check runs before the far-node lookup. An edge whose operator cannot be
     evaluated cannot be evaluated no matter what arrives later, so escrowing it on
@@ -2901,14 +2932,14 @@ def test_verifier_unknown_edge_operator_fails_closed():
         verfer = Verifier(hby=ianHby)
 
         # A token outside the recognized set, alone and alongside a recognized one.
-        # The list case matters most: dropping one member of ['NI2I', 'I1I'] leaves a
+        # The list case matters most: dropping one member of ['NI2I', 'BOGUS'] leaves a
         # list that looks fully understood.
         with pytest.raises(UnsupportedOperatorError):
-            verfer.verifyChain(unsavedSaid, 'I1I', ian.pre)
+            verfer.verifyChain(unsavedSaid, 'BOGUS', ian.pre)
         with pytest.raises(UnsupportedOperatorError):
-            verfer.verifyChain(unsavedSaid, ['NI2I', 'I1I'], ian.pre)
+            verfer.verifyChain(unsavedSaid, ['NI2I', 'BOGUS'], ian.pre)
         with pytest.raises(UnsupportedOperatorError):
-            verfer.verifyChain(unsavedSaid, ['I1I'], ian.pre)
+            verfer.verifyChain(unsavedSaid, ['BOGUS'], ian.pre)
 
         # Absent and empty are not unknown: the spec applies the default rule to both
         # (ACDC spec, Edge Section > Edge > Operator, `o` field). Each therefore

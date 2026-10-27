@@ -4163,6 +4163,49 @@ class Kevery:
         Returns .db.prefixes"""
         return self.db.prefixes
 
+    def isDelegated(self, pre, delpre):
+        """Determine whether ``pre`` is an anchored descendant of ``delpre``.
+
+        The relation is settled by each delegate's inception event. Every hop must
+        have its delegator's anchoring seal, and no intermediate delegator may carry
+        the DND trait. Missing KEL or anchoring evidence is undecided so callers can
+        fetch it and retry; a complete chain ending elsewhere is false.
+
+        Returns:
+            bool | None: True for a verified chain, False for a proven mismatch or
+                DND violation, and None when required evidence is missing.
+        """
+        pending = False
+        seen = set()
+        while pre not in seen:
+            seen.add(pre)
+
+            if pre not in self.kevers:
+                return None
+
+            kever = self.kevers[pre]
+            if kever.delpre is None:
+                return False
+
+            if kever.delpre not in self.kevers:
+                return None
+
+            if self.kevers[kever.delpre].doNotDelegate:
+                return False
+
+            serder = self.db.evts.get(keys=(pre, pre))
+            if serder is None or kever.fetchDelegatingEvent(
+                    delpre=kever.delpre, serder=serder,
+                    original=False, eager=True) is None:
+                pending = True
+
+            if kever.delpre == delpre:
+                return None if pending else True
+
+            pre = kever.delpre
+
+        return False
+
     def fetchWitnessState(self, pre, sn):
         """ Returns the list of witness for the identifier prefix at the sequence number
 
