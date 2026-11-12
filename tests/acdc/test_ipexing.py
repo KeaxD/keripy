@@ -3036,6 +3036,14 @@ def test_ipex_v2_rejects_false_aggregate_commitments():
         assert badRoot.sad["A"][0] == falseAgid
         assert rootAggor.agid != falseAgid
 
+        # A blank AGID is not a disclosure placeholder. It fails the same
+        # commitment check as any other value that is not the computed AGID.
+        blankRoot = acdcagg(israid=hab.pre,
+                            uuid=Noncer().qb64,
+                            aggregate=["", rootAggor.ael[1]])
+        assert blankRoot.verify() is True
+        assert blankRoot.sad["A"][0] == ""
+
         # Then keep the AGID correct while falsifying one aggregate element.
         falseElementSaid = Diger(ser=b"not the aggregate element").qb64
         falseElement = dict(d=falseElementSaid,
@@ -3053,8 +3061,9 @@ def test_ipex_v2_rejects_false_aggregate_commitments():
         assert badElement.sad["A"][1]["d"] == falseElementSaid
         assert elementAggor.ael[1]["d"] != falseElementSaid
 
-        # Both malformed credentials are rejected as direct Grants.
+        # All malformed credentials are rejected as direct Grants.
         for message, credential in (("Here is a false aggregate root", badRoot),
+                                    ("Here is a blank aggregate root", blankRoot),
                                     ("Here is a false aggregate element", badElement)):
             grantExn, grantAtc = ipexGrant(
                 hab=hab,
@@ -3547,9 +3556,16 @@ def test_ipex_v2_validates_offer_metadata_loaded_after_grant():
         assert hby.db.epse.get(keys=(grantExn.said,)) is None
 
 
-def test_ipex_v2_offer_fulfillment_allows_compatible_acdc_message_types():
-    """Section commitments, not ACDC wire shape, bind Offer to Grant."""
-    with openHby(name="ipex-v2-compatible-acdc-types",
+@pytest.mark.parametrize(
+    "messageTypeSchema, accepted",
+    [({"enum": [Ilks.acm, Ilks.act]}, True),
+     ({"const": Ilks.acm}, False)],
+    ids=("schema-allows-both", "schema-allows-only-offer"),
+)
+def test_ipex_v2_offer_fulfillment_uses_schema_for_acdc_message_type(
+        messageTypeSchema, accepted):
+    """The shared schema, not the Offer alone, governs ACDC message type."""
+    with openHby(name=f"ipex-v2-acdc-type-{accepted}",
                  base="test",
                  version=Vrsn_2_0) as hby:
         hab = hby.makeHab(name="test")
@@ -3557,7 +3573,8 @@ def test_ipex_v2_offer_fulfillment_allows_compatible_acdc_message_types():
         exc = Exchanger(hby=hby, handlers=[])
         loadHandlers(hby=hby, exc=exc, notifier=recorder)
 
-        # One schema explicitly permits the field-map and fixed-field forms.
+        # The two cases differ only in whether the shared schema permits the
+        # fixed-field Grant as well as the field-map metadata Offer.
         schemer = Schemer(sed={
             "$id": "",
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3566,7 +3583,7 @@ def test_ipex_v2_offer_fulfillment_allows_compatible_acdc_message_types():
             "required": ["v", "t", "d", "u", "i", "s", "a"],
             "properties": {
                 "v": {"type": "string"},
-                "t": {"enum": ["acm", "act"]},
+                "t": messageTypeSchema,
                 "d": {"type": "string"},
                 "u": {"type": "string"},
                 "i": {"type": "string"},
@@ -3619,7 +3636,8 @@ def test_ipex_v2_offer_fulfillment_allows_compatible_acdc_message_types():
             agree=agreeExn,
         )
 
-        # Both forms validate against the same schema and section commitments.
+        # Offer fulfillment accepts a type change only when both forms validate
+        # against the same schema and section commitments.
         for exn, atc in ((applyExn, applyAtc),
                          (offerExn, offerAtc),
                          (agreeExn, agreeAtc),
@@ -3628,7 +3646,8 @@ def test_ipex_v2_offer_fulfillment_allows_compatible_acdc_message_types():
             Parser(version=Vrsn_2_0).parse(ims=ims, framed=False, exc=exc)
             assert ims == bytearray()
 
-        assert hby.db.exns.get(keys=(grantExn.said,)) is not None
+        stored = hby.db.exns.get(keys=(grantExn.said,))
+        assert (stored is not None) is accepted
         assert hby.db.epse.get(keys=(grantExn.said,)) is None
 
 

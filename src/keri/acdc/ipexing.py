@@ -901,7 +901,7 @@ class IpexHandler:
                                   kind=nserder.kind)
                 except Exception:
                     return None
-                if aggregate[0] and aggregate[0] != aggor.agid:
+                if aggregate[0] != aggor.agid:
                     return None
                 for carried, computed in zip(aggregate[1:], aggor.ael[1:]):
                     if (isinstance(carried, Mapping) and carried.get("d") and
@@ -1151,6 +1151,9 @@ class IpexHandler:
 
         An exact root SAID fulfills the Offer directly. When a metadata Offer
         names a different root, its section commitments must match the Grant.
+        The Offer does not separately promise the ACDC message type ``t``;
+        both nodes must satisfy the shared schema, which determines whether a
+        different message type is allowed.
 
         Returns:
             bool: True when the promise is fulfilled or no ACDC-specific Offer
